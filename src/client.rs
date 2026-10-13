@@ -6,17 +6,19 @@
 //! requests and responses are bounded, and only invalid sessions trigger a
 //! single-flight refresh followed by exactly one retry of the original call.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::Read;
-use std::net::IpAddr;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::net::Ipv4Addr;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 use std::sync::Weak;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REQUEST_BYTES: usize = 4 << 20;
@@ -62,7 +64,7 @@ impl fmt::Display for ClientError {
 impl std::error::Error for ClientError {}
 
 /// The rotating credential bundle a session store persists.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Deserialize, PartialEq)]
 pub struct SessionCredentials {
     pub access_token: String,
     pub refresh_token: String,
@@ -70,6 +72,20 @@ pub struct SessionCredentials {
     pub refresh_expires_at: String,
     pub user_id: String,
     pub session_id: String,
+}
+
+impl fmt::Debug for SessionCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionCredentials")
+            .field("access_token", &"[REDACTED]")
+            .field("refresh_token", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .field("refresh_expires_at", &self.refresh_expires_at)
+            .field("user_id", &self.user_id)
+            .field("session_id", &self.session_id)
+            .finish()
+    }
 }
 
 /// Caller-owned session credential storage. The SDK never writes credentials
@@ -83,6 +99,8 @@ pub trait SessionStore: Send + Sync + 'static {
     fn credentials(&self) -> SessionCredentials;
     /// Rotates credentials through `operation`; the store persists and returns
     /// the credentials it accepted.
+    /// Panic recovery requires unwinding; abort builds terminate, and the
+    /// caller's panic hook still runs before recovery and may expose its payload.
     fn refresh(
         &self,
         operation: &mut dyn FnMut(SessionCredentials) -> Result<SessionCredentials, ClientError>,
@@ -159,7 +177,7 @@ impl Client {
     /// Invokes one declared operation and returns the JSON response value.
     pub fn invoke(&self, operation: &str, input: &Value) -> Result<Value, ClientError> {
         let Some(store) = self.session.as_ref() else {
-            return self.invoke_once(operation, input, self.bearer.as_deref());
+            return self.invoke_once(operation, input, self.bearer.as_deref(), None);
         };
         let credentials = store.credentials();
         self.guard_store_credentials(store, &credentials)?;
@@ -168,13 +186,13 @@ impl Client {
         } else {
             Some(credentials.access_token.clone())
         };
-        let result = self.invoke_once(operation, input, token.as_deref());
+        let result = self.invoke_once(operation, input, token.as_deref(), None);
         match result {
             Err(ClientError::Operation(OperationError { code, status: 401 }))
                 if operation != REFRESH_OPERATION && code == "invalid_token" =>
             {
                 let credentials = self.refresh_session(store, &credentials.access_token)?;
-                self.invoke_once(operation, input, Some(&credentials.access_token))
+                self.invoke_once(operation, input, Some(&credentials.access_token), None)
             }
             other => other,
         }
@@ -205,14 +223,33 @@ impl Client {
                 }
             }
         };
+        #[cfg(test)]
+        if !leader && let Some(observer) = refreshes.joined.lock().expect("join observer").as_ref()
+        {
+            let _ = observer.send(());
+        }
         if leader {
-            let outcome = self.run_refresh(store, &current, failed_access);
-            flight.finish(outcome);
-            refreshes
-                .map
-                .lock()
-                .expect("refresh flight map")
-                .remove(&refresh_token);
+            let mut confirmed_rejection = false;
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                self.run_refresh(store, &current, failed_access, &mut confirmed_rejection)
+            }))
+            .unwrap_or_else(|_| Err(session_refresh_failed()));
+            if outcome.is_err() && !confirmed_rejection {
+                blocked_refresh_tokens()
+                    .lock()
+                    .expect("refresh token gate")
+                    .insert(Sha256::digest(current.refresh_token.as_bytes()).into());
+            }
+            // A failed exchange may have consumed the token, including a failed save.
+            flight.finish(outcome.clone().map_err(|_| invalid_token_error()));
+            if outcome.is_ok() || confirmed_rejection {
+                refreshes
+                    .map
+                    .lock()
+                    .expect("refresh flight map")
+                    .remove(&refresh_token);
+            }
+            outcome?;
         }
         flight.result()?;
         let current = store.credentials();
@@ -225,31 +262,64 @@ impl Client {
         store: &Arc<dyn SessionStore>,
         current: &SessionCredentials,
         failed_access: &str,
+        confirmed_rejection: &mut bool,
     ) -> Result<String, ClientError> {
         let mut rejected = current.clone();
+        let mut refresh_rejected = false;
+        let mut callback_error = None;
+        let mut attempted_token = None;
         let outcome = store.refresh(&mut |latest| {
-            self.guard_store_credentials(store, &latest)?;
-            rejected = latest.clone();
-            if latest.access_token != failed_access {
-                return Ok(latest);
+            let result = (|| {
+                self.guard_store_credentials(store, &latest)?;
+                rejected = latest.clone();
+                if latest.access_token != failed_access {
+                    return Ok(latest);
+                }
+                let fingerprint = Sha256::digest(latest.refresh_token.as_bytes()).into();
+                if !blocked_refresh_tokens()
+                    .lock()
+                    .expect("refresh token gate")
+                    .insert(fingerprint)
+                {
+                    return Err(invalid_token_error());
+                }
+                attempted_token = Some(fingerprint);
+                let value = self.invoke_once(
+                    REFRESH_OPERATION,
+                    &serde_json::json!({ "refresh_token": latest.refresh_token }),
+                    None,
+                    Some(&mut refresh_rejected),
+                )?;
+                read_credentials(value)
+            })();
+            if let Err(error) = &result {
+                callback_error = Some(error.clone());
             }
-            let value = self.invoke_once(
-                REFRESH_OPERATION,
-                &serde_json::json!({ "refresh_token": latest.refresh_token }),
-                None,
-            )?;
-            read_credentials(value)
+            result
         });
         match outcome {
-            Ok(refreshed) => Ok(refreshed.access_token),
-            Err(error) => {
-                if matches!(
-                    error,
-                    ClientError::Operation(OperationError { status: 401, .. })
-                ) {
-                    store.clear(&rejected);
+            Ok(refreshed) => {
+                self.guard_store_credentials(store, &refreshed)?;
+                if let Some(fingerprint) = attempted_token {
+                    blocked_refresh_tokens()
+                        .lock()
+                        .expect("refresh token gate")
+                        .remove(&fingerprint);
                 }
-                Err(error)
+                Ok(refreshed.access_token)
+            }
+            Err(_) => {
+                if refresh_rejected {
+                    store.clear(&rejected);
+                    *confirmed_rejection = true;
+                    if let Some(fingerprint) = attempted_token {
+                        blocked_refresh_tokens()
+                            .lock()
+                            .expect("refresh token gate")
+                            .remove(&fingerprint);
+                    }
+                }
+                Err(callback_error.unwrap_or_else(session_refresh_failed))
             }
         }
     }
@@ -259,6 +329,7 @@ impl Client {
         operation: &str,
         input: &Value,
         bearer: Option<&str>,
+        rejected: Option<&mut bool>,
     ) -> Result<Value, ClientError> {
         if !valid_operation_name(operation) {
             return Err(ClientError::Protocol("invalid operation name".into()));
@@ -306,8 +377,15 @@ impl Client {
         })?;
         if !(200..300).contains(&status) {
             let code = match value.get("error").and_then(Value::as_str) {
-                Some(code) if valid_error_code(code) => code.to_owned(),
-                _ => "operation_failed".into(),
+                Some(code) if valid_error_code(code) => {
+                    if status == 401
+                        && let Some(rejected) = rejected
+                    {
+                        *rejected = true;
+                    }
+                    code.to_owned()
+                }
+                _ => "invalid_response".into(),
             };
             return Err(ClientError::Operation(OperationError { code, status }));
         }
@@ -352,6 +430,33 @@ pub fn decode_output<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, 
 #[derive(Default)]
 struct RefreshFlights {
     map: Mutex<HashMap<String, Arc<Flight>>>,
+    #[cfg(test)]
+    joined: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+}
+
+// No eviction: another store may still hold a token whose consumption is unknown.
+fn blocked_refresh_tokens() -> &'static Mutex<HashSet<[u8; 32]>> {
+    static TOKENS: OnceLock<Mutex<HashSet<[u8; 32]>>> = OnceLock::new();
+    TOKENS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn invalid_token_error() -> ClientError {
+    ClientError::Operation(OperationError {
+        code: "invalid_token".into(),
+        status: 401,
+    })
+}
+
+fn session_refresh_failed() -> ClientError {
+    ClientError::Protocol("session refresh failed".into())
+}
+
+#[cfg(test)]
+pub(crate) fn observe_refresh_joins(
+    store: &Arc<dyn SessionStore>,
+    observer: std::sync::mpsc::Sender<()>,
+) {
+    *store_flights(store).joined.lock().expect("join observer") = Some(observer);
 }
 
 static STORE_FLIGHTS: OnceLock<Mutex<Vec<(Weak<dyn SessionStore>, Arc<RefreshFlights>)>>> =
@@ -405,12 +510,10 @@ impl Flight {
 
 fn validate_origin(origin: &str) -> Result<String, ClientError> {
     let invalid = || {
-        ClientError::Protocol(
-            "operation endpoint must be an HTTPS or loopback HTTP origin".into(),
-        )
+        ClientError::Protocol("operation endpoint must be an HTTPS or loopback HTTP origin".into())
     };
-    if origin.contains('#') {
-        // The URI parser drops fragments instead of rejecting them.
+    if origin.contains(['?', '#']) {
+        // Reject even empty markers before URI parsing can discard them.
         return Err(invalid());
     }
     let uri: ureq::http::Uri = origin.parse().map_err(|_| invalid())?;
@@ -419,21 +522,14 @@ fn validate_origin(origin: &str) -> Result<String, ClientError> {
     if authority.as_str().contains('@') {
         return Err(invalid());
     }
-    let ip: Option<IpAddr> = host_ip(authority.host());
-    let secure =
-        scheme == "https" || (scheme == "http" && ip.is_some_and(|ip| ip.is_loopback()));
+    let host = authority.host();
+    let secure = scheme == "https"
+        || (scheme == "http"
+            && (host == "[::1]" || host.parse::<Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())));
     if !secure || uri.path() != "/" || uri.query().is_some() {
         return Err(invalid());
     }
     Ok(format!("{}://{}", scheme, authority))
-}
-
-fn host_ip(host: &str) -> Option<IpAddr> {
-    let unbracketed = host
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-        .unwrap_or(host);
-    unbracketed.parse().ok()
 }
 
 fn read_credentials(value: Value) -> Result<SessionCredentials, ClientError> {
@@ -475,5 +571,8 @@ fn valid_segment(segment: &str) -> bool {
 }
 
 fn valid_error_code(code: &str) -> bool {
-    !code.is_empty() && code.bytes().all(|byte| byte == b'_' || byte.is_ascii_lowercase())
+    !code.is_empty()
+        && code
+            .bytes()
+            .all(|byte| byte == b'_' || byte.is_ascii_lowercase())
 }

@@ -2,7 +2,8 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 
 /// One recorded client request.
@@ -16,17 +17,31 @@ pub struct Request {
 /// Starts a loopback server that answers the next `responses.len()`
 /// connections in order and records every request it receives.
 pub fn serve(responses: &[String]) -> (String, Receiver<Request>) {
+    serve_with(responses, |_| {})
+}
+
+/// Allows a test to hold a response at an observed request, without timing races.
+pub fn serve_with(
+    responses: &[String],
+    before_response: impl Fn(usize) + Send + Sync + 'static,
+) -> (String, Receiver<Request>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
     let origin = format!("http://{}", listener.local_addr().expect("local address"));
     let (sender, receiver) = channel();
     let scripted: Vec<String> = responses.to_vec();
+    let before_response = Arc::new(before_response);
     thread::spawn(move || {
-        for response in scripted {
+        for (index, response) in scripted.into_iter().enumerate() {
             let (mut stream, _) = listener.accept().expect("accept connection");
-            let request = read_request(&mut stream);
-            sender.send(request).expect("record request");
-            let _ = stream.write_all(response.as_bytes());
-            let _ = stream.flush();
+            let sender = sender.clone();
+            let before_response = before_response.clone();
+            thread::spawn(move || {
+                let request = read_request(&mut stream);
+                sender.send(request).expect("record request");
+                before_response(index);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            });
         }
     });
     (origin, receiver)
@@ -80,9 +95,8 @@ fn read_request(stream: &mut TcpStream) -> Request {
         assert!(read > 0, "connection closed before request body ended");
         buffer.extend_from_slice(&chunk[..read]);
     }
-    let body =
-        String::from_utf8(buffer[body_start..body_start + content_length].to_vec())
-            .expect("request body utf8");
+    let body = String::from_utf8(buffer[body_start..body_start + content_length].to_vec())
+        .expect("request body utf8");
     Request {
         path,
         authorization,

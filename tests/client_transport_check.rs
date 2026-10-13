@@ -35,6 +35,24 @@ fn rejects_unsupported_origins() {
         "https://example.com/?a=b",
         "https://example.com/#anchor",
         "http://192.168.1.10:8080",
+        "http://localhost:8080",
+        "http://127.1",
+        "http://0x7f000001",
+        "http://0x7f.0.0.1",
+        "http://0177.0.0.1",
+        "http://2130706433",
+        "http://127.00.0.1",
+        "http://[::ffff:127.0.0.1]",
+        "http://[0:0:0:0:0:0:0:1]",
+        "http://[::01]",
+        "http://%31%32%37.0.0.1",
+        "https://example.com//",
+        "https://example.com?",
+        "https://example.com#",
+        "https://example.com/?",
+        "https://example.com/#",
+        "http://127.0.0.1?",
+        "http://[::1]#",
     ] {
         assert!(
             Client::new(origin).is_err(),
@@ -50,6 +68,11 @@ fn accepts_https_and_loopback_http_origins() {
         "http://127.0.0.1:8080",
         "http://127.254.0.1",
         "http://[::1]:9000",
+        "https://example.com/",
+        "http://127.0.0.1:8080/",
+        "http://127.1.2.3",
+        "http://127.255.255.255",
+        "http://[::1]/",
     ] {
         assert!(
             Client::new(origin).is_ok(),
@@ -61,7 +84,14 @@ fn accepts_https_and_loopback_http_origins() {
 #[test]
 fn rejects_invalid_operation_names_without_sending() {
     let client = Client::new("https://example.com").expect("valid origin");
-    for operation in ["", "Service.Method", "svc.method.extra", "svc.", ".method", "svc-method"] {
+    for operation in [
+        "",
+        "Service.Method",
+        "svc.method.extra",
+        "svc.",
+        ".method",
+        "svc-method",
+    ] {
         let message = protocol_message(client.invoke(operation, &json!({})).unwrap_err());
         assert_eq!(message, "invalid operation name", "operation {operation}");
     }
@@ -71,7 +101,11 @@ fn rejects_invalid_operation_names_without_sending() {
 fn rejects_oversized_requests() {
     let client = Client::new("https://example.com").expect("valid origin");
     let oversized = "a".repeat(4 << 20);
-    let message = protocol_message(client.invoke("svc.op", &json!({ "text": oversized })).unwrap_err());
+    let message = protocol_message(
+        client
+            .invoke("svc.op", &json!({ "text": oversized }))
+            .unwrap_err(),
+    );
     assert_eq!(message, "operation request is too large");
 }
 
@@ -79,12 +113,10 @@ fn rejects_oversized_requests() {
 fn rejects_oversized_responses() {
     let (origin, receiver) = serve(&[response(
         "HTTP/1.1 200 OK",
-        &format!(
-            "{{\"value\":\"{}\"}}",
-            "a".repeat((1 << 20) + 16)
-        ),
+        &format!("{{\"value\":\"{}\"}}", "a".repeat((1 << 20) + 16)),
     )]);
-    let client = Client::with_timeout(&origin, std::time::Duration::from_secs(10)).expect("valid origin");
+    let client =
+        Client::with_timeout(&origin, std::time::Duration::from_secs(10)).expect("valid origin");
     let message = protocol_message(client.invoke("svc.op", &json!({})).unwrap_err());
     assert_eq!(message, "operation response is too large");
     let request = receiver.recv().expect("recorded request");
@@ -95,11 +127,10 @@ fn rejects_oversized_responses() {
 fn roundtrip_rejects_redirects_and_preserves_error_codes() {
     let (origin, receiver) = serve(&[
         response("HTTP/1.1 200 OK", "{\"ok\":true}"),
-        response(
-            "HTTP/1.1 302 Found",
-            "",
-        )
-        .replace("content-length: 0", "content-length: 0\r\nlocation: https://elsewhere.example.com"),
+        response("HTTP/1.1 302 Found", "").replace(
+            "content-length: 0",
+            "content-length: 0\r\nlocation: https://elsewhere.example.com",
+        ),
         response("HTTP/1.1 409 Conflict", "{\"error\":\"out_of_stock\"}"),
         response("HTTP/1.1 400 Bad Request", "{\"error\":\"Bad Code!\"}"),
         response("HTTP/1.1 500 Internal Server Error", "not json"),
@@ -109,24 +140,64 @@ fn roundtrip_rejects_redirects_and_preserves_error_codes() {
         .with_bearer(&"A".repeat(43))
         .expect("valid token");
 
-    let value = client.invoke("catalog.find", &json!({ "id": "one" })).expect("roundtrip");
+    let value = client
+        .invoke("catalog.find", &json!({ "id": "one" }))
+        .expect("roundtrip");
     assert_eq!(value, json!({ "ok": true }));
     let request = receiver.recv().expect("recorded request");
     assert_eq!(request.path, "/catalog.find");
-    assert_eq!(request.authorization.as_deref(), Some("Bearer AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+    assert_eq!(
+        request.authorization.as_deref(),
+        Some("Bearer AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+    );
     assert!(request.body.contains("\"id\":\"one\""));
 
     let error = operation_error(client.invoke("catalog.find", &json!({})).unwrap_err());
-    assert_eq!((error.code.as_str(), error.status), ("redirect_not_allowed", 302));
+    assert_eq!(
+        (error.code.as_str(), error.status),
+        ("redirect_not_allowed", 302)
+    );
 
     let error = operation_error(client.invoke("catalog.find", &json!({})).unwrap_err());
     assert_eq!((error.code.as_str(), error.status), ("out_of_stock", 409));
 
     let error = operation_error(client.invoke("catalog.find", &json!({})).unwrap_err());
-    assert_eq!((error.code.as_str(), error.status), ("operation_failed", 400));
+    assert_eq!(
+        (error.code.as_str(), error.status),
+        ("invalid_response", 400)
+    );
 
     let error = operation_error(client.invoke("catalog.find", &json!({})).unwrap_err());
-    assert_eq!((error.code.as_str(), error.status), ("invalid_response", 500));
+    assert_eq!(
+        (error.code.as_str(), error.status),
+        ("invalid_response", 500)
+    );
+}
+
+#[test]
+fn invalid_error_envelopes_preserve_http_status() {
+    for body in [
+        "not JSON",
+        "{}",
+        r#"{"message":"unavailable"}"#,
+        r#"{"error":""}"#,
+        r#"{"error":"Conflict"}"#,
+        r#"{"error":"conflict1"}"#,
+        r#"{"error":"bad-request"}"#,
+        r#"{"error":42}"#,
+        r#"{"error":null}"#,
+        r#"{"error":{}}"#,
+        r#"{"error":[]}"#,
+    ] {
+        let (origin, receiver) = serve(&[response("HTTP/1.1 503 Unavailable", body)]);
+        let client = Client::new(&origin).expect("valid origin");
+        let error = operation_error(client.invoke("probe.echo", &json!({})).unwrap_err());
+        assert_eq!(
+            (error.code.as_str(), error.status),
+            ("invalid_response", 503)
+        );
+        assert_eq!(receiver.recv().expect("request").path, "/probe.echo");
+    }
 }
 
 #[test]
@@ -144,7 +215,13 @@ fn encode_and_decode_enforce_declared_field_types() {
     assert_eq!(encoded, json!({ "id": "one" }));
 
     let output: Output = client::decode_output(json!({ "id": "one", "count": 3 })).expect("decode");
-    assert_eq!(output, Output { id: "one".into(), count: 3 });
+    assert_eq!(
+        output,
+        Output {
+            id: "one".into(),
+            count: 3
+        }
+    );
 
     for broken in [
         json!({ "id": "one" }),
