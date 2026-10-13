@@ -47,7 +47,10 @@ impl TransactionPort {
             .await
             .map_err(|_| OperationError::internal())?;
         match (response.error, response.lease) {
-            (None, Some(lease)) => Ok(Self { rid: port.rid, lease }),
+            (None, Some(lease)) => Ok(Self {
+                rid: port.rid,
+                lease,
+            }),
             _ => Err(OperationError::internal()),
         }
     }

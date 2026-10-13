@@ -47,7 +47,14 @@ impl Column {
         unique: bool,
         references: &'static str,
     ) -> Column {
-        Column { database_name, kind, nullable, optional, unique, references }
+        Column {
+            database_name,
+            kind,
+            nullable,
+            optional,
+            unique,
+            references,
+        }
     }
 }
 
@@ -63,11 +70,17 @@ impl TableDefinition {
         primary_key: &'static [&'static str],
         columns: &'static [Column],
     ) -> TableDefinition {
-        TableDefinition { name, primary_key, columns }
+        TableDefinition {
+            name,
+            primary_key,
+            columns,
+        }
     }
 
     pub fn column(&self, name: &str) -> Option<&Column> {
-        self.columns.iter().find(|column| column.database_name == name)
+        self.columns
+            .iter()
+            .find(|column| column.database_name == name)
     }
 
     fn select_list(&self) -> Result<String, OperationError> {
@@ -107,9 +120,19 @@ impl Operator {
 /// filter compiles.
 #[derive(Clone)]
 pub enum Filter {
-    Comparison { column: Column, operator: Operator, value: serde_json::Value },
-    In { column: Column, values: Vec<serde_json::Value> },
-    Null { column: Column, negated: bool },
+    Comparison {
+        column: Column,
+        operator: Operator,
+        value: serde_json::Value,
+    },
+    In {
+        column: Column,
+        values: Vec<serde_json::Value>,
+    },
+    Null {
+        column: Column,
+        negated: bool,
+    },
     And(Vec<Filter>),
     Or(Vec<Filter>),
     Not(Box<Filter>),
@@ -117,28 +140,58 @@ pub enum Filter {
 
 impl Filter {
     pub fn eq(column: Column, value: serde_json::Value) -> Filter {
-        Filter::Comparison { column, operator: Operator::Equal, value }
+        Filter::Comparison {
+            column,
+            operator: Operator::Equal,
+            value,
+        }
     }
     pub fn ne(column: Column, value: serde_json::Value) -> Filter {
-        Filter::Comparison { column, operator: Operator::NotEqual, value }
+        Filter::Comparison {
+            column,
+            operator: Operator::NotEqual,
+            value,
+        }
     }
     pub fn lt(column: Column, value: serde_json::Value) -> Filter {
-        Filter::Comparison { column, operator: Operator::Less, value }
+        Filter::Comparison {
+            column,
+            operator: Operator::Less,
+            value,
+        }
     }
     pub fn le(column: Column, value: serde_json::Value) -> Filter {
-        Filter::Comparison { column, operator: Operator::LessEqual, value }
+        Filter::Comparison {
+            column,
+            operator: Operator::LessEqual,
+            value,
+        }
     }
     pub fn gt(column: Column, value: serde_json::Value) -> Filter {
-        Filter::Comparison { column, operator: Operator::Greater, value }
+        Filter::Comparison {
+            column,
+            operator: Operator::Greater,
+            value,
+        }
     }
     pub fn ge(column: Column, value: serde_json::Value) -> Filter {
-        Filter::Comparison { column, operator: Operator::GreaterEqual, value }
+        Filter::Comparison {
+            column,
+            operator: Operator::GreaterEqual,
+            value,
+        }
     }
     pub fn is_null(column: Column) -> Filter {
-        Filter::Null { column, negated: false }
+        Filter::Null {
+            column,
+            negated: false,
+        }
     }
     pub fn is_not_null(column: Column) -> Filter {
-        Filter::Null { column, negated: true }
+        Filter::Null {
+            column,
+            negated: true,
+        }
     }
     pub fn is_in(column: Column, values: Vec<serde_json::Value>) -> Filter {
         Filter::In { column, values }
@@ -201,13 +254,13 @@ pub struct Repository {
 
 impl Repository {
     pub fn new(table: &'static TableDefinition, port: DatabasePort) -> Repository {
-        Repository { table, connection: Connection::Pooled(port) }
+        Repository {
+            table,
+            connection: Connection::Pooled(port),
+        }
     }
 
-    pub fn transactional(
-        table: &'static TableDefinition,
-        connection: Connection,
-    ) -> Repository {
+    pub fn transactional(table: &'static TableDefinition, connection: Connection) -> Repository {
         Repository { table, connection }
     }
 
@@ -220,9 +273,7 @@ impl Repository {
         &self,
         insert: &serde_json::Value,
     ) -> Result<R, OperationError> {
-        let entries = insert
-            .as_object()
-            .ok_or_else(OperationError::internal)?;
+        let entries = insert.as_object().ok_or_else(OperationError::internal)?;
         let mut names = Vec::new();
         let mut params = Vec::new();
         for (name, value) in entries {
@@ -237,8 +288,7 @@ impl Repository {
             .iter()
             .map(|name| quote(name))
             .collect::<Result<_, _>>()?;
-        let placeholders: Vec<String> =
-            (1..=names.len()).map(placeholder).collect();
+        let placeholders: Vec<String> = (1..=names.len()).map(placeholder).collect();
         let sql = format!(
             "insert into {} ({}) values ({}) returning {}",
             quote(self.table.name)?,
@@ -315,7 +365,8 @@ impl Repository {
         key: &serde_json::Value,
         patch: &serde_json::Value,
     ) -> Result<R, OperationError> {
-        self.update_optional(key, None, patch).await?
+        self.update_optional(key, None, patch)
+            .await?
             .ok_or_else(OperationError::internal)
     }
 
@@ -334,9 +385,7 @@ impl Repository {
         filter: Option<&Filter>,
         patch: &serde_json::Value,
     ) -> Result<Option<R>, OperationError> {
-        let entries = patch
-            .as_object()
-            .ok_or_else(OperationError::internal)?;
+        let entries = patch.as_object().ok_or_else(OperationError::internal)?;
         if entries.is_empty() {
             return Err(OperationError::internal());
         }
@@ -374,7 +423,12 @@ impl Repository {
 
     pub async fn delete(&self, key: &serde_json::Value) -> Result<bool, OperationError> {
         let (where_clause, params) = self.primary_key_filter(key, 0)?;
-        let sql = format!("delete from {} where {} returning {}", quote(self.table.name)?, where_clause, self.table.select_list()?);
+        let sql = format!(
+            "delete from {} where {} returning {}",
+            quote(self.table.name)?,
+            where_clause,
+            self.table.select_list()?
+        );
         let rows = self.connection.query(&sql, &params).await?;
         Ok(!rows.is_empty())
     }
@@ -384,9 +438,7 @@ impl Repository {
         key: &serde_json::Value,
         offset: usize,
     ) -> Result<(String, Vec<serde_json::Value>), OperationError> {
-        let entries = key
-            .as_object()
-            .ok_or_else(OperationError::internal)?;
+        let entries = key.as_object().ok_or_else(OperationError::internal)?;
         if entries.len() != self.table.primary_key.len() {
             return Err(OperationError::internal());
         }
@@ -397,11 +449,13 @@ impl Repository {
                 .table
                 .column(name)
                 .ok_or_else(OperationError::internal)?;
-            let value = entries
-                .get(*name)
-                .ok_or_else(OperationError::internal)?;
+            let value = entries.get(*name).ok_or_else(OperationError::internal)?;
             encode_value(column, value, &mut params)?;
-            terms.push(format!("{} = {}", quote(name)?, placeholder(offset + params.len())));
+            terms.push(format!(
+                "{} = {}",
+                quote(name)?,
+                placeholder(offset + params.len())
+            ));
         }
         Ok((terms.join(" and "), params))
     }
@@ -425,26 +479,32 @@ impl Repository {
         params: &[serde_json::Value],
     ) -> Result<Vec<R>, OperationError> {
         let rows = self.connection.query(sql, params).await?;
-        rows.into_iter()
-            .map(|row| self.decode_row(row))
-            .collect()
+        rows.into_iter().map(|row| self.decode_row(row)).collect()
     }
 
     fn decode_row<R: serde::de::DeserializeOwned>(
-        &self, mut row: serde_json::Map<String, serde_json::Value>,
+        &self,
+        mut row: serde_json::Map<String, serde_json::Value>,
     ) -> Result<R, OperationError> {
         for column in self.table.columns {
-            let value = row.get_mut(column.database_name).ok_or_else(OperationError::internal)?;
+            let value = row
+                .get_mut(column.database_name)
+                .ok_or_else(OperationError::internal)?;
             if column.kind == Kind::Timestamp && !value.is_null() {
                 let text = value.as_str().ok_or_else(OperationError::internal)?;
                 let timestamp = chrono::DateTime::parse_from_rfc3339(text)
                     .or_else(|_| chrono::DateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f%#z"))
                     .map_err(|_| OperationError::internal())?;
-                *value = serde_json::Value::String(timestamp.to_utc().to_rfc3339_opts(chrono::SecondsFormat::Micros, true));
+                *value = serde_json::Value::String(
+                    timestamp
+                        .to_utc()
+                        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+                );
             }
             encode_value(column, value, &mut Vec::new())?;
         }
-        serde_json::from_value(serde_json::Value::Object(row)).map_err(|_| OperationError::internal())
+        serde_json::from_value(serde_json::Value::Object(row))
+            .map_err(|_| OperationError::internal())
     }
 }
 
@@ -460,7 +520,11 @@ fn compile_filter(
     params: &mut Vec<serde_json::Value>,
 ) -> Result<String, OperationError> {
     match filter {
-        Filter::Comparison { column, operator, value } => {
+        Filter::Comparison {
+            column,
+            operator,
+            value,
+        } => {
             encode_value(column, value, params)?;
             Ok(format!(
                 "{} {} {}",
@@ -486,7 +550,11 @@ fn compile_filter(
         }
         Filter::Null { column, negated } => {
             let base = format!("{} is null", quote(column.database_name)?);
-            Ok(if *negated { format!("not ({})", base) } else { base })
+            Ok(if *negated {
+                format!("not ({})", base)
+            } else {
+                base
+            })
         }
         Filter::And(filters) => join_filters(filters, " and ", params),
         Filter::Or(filters) if filters.is_empty() => Ok("false".into()),
@@ -537,18 +605,32 @@ fn encode_value(
         },
         Kind::Id | Kind::Text | Kind::Date | Kind::Timestamp => {
             let text = value.as_str().ok_or_else(OperationError::internal)?;
-            if text.contains('\0') { return Err(OperationError::internal()); }
+            if text.contains('\0') {
+                return Err(OperationError::internal());
+            }
             match column.kind {
-                Kind::Id if text.len() != 36 || !text.bytes().enumerate().all(|(index, byte)| {
-                    if [8, 13, 18, 23].contains(&index) { byte == b'-' } else { byte.is_ascii_hexdigit() }
-                }) => return Err(OperationError::internal()),
+                Kind::Id
+                    if text.len() != 36
+                        || !text.bytes().enumerate().all(|(index, byte)| {
+                            if [8, 13, 18, 23].contains(&index) {
+                                byte == b'-'
+                            } else {
+                                byte.is_ascii_hexdigit()
+                            }
+                        }) =>
+                {
+                    return Err(OperationError::internal());
+                }
                 Kind::Date => {
                     let date = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
                         .map_err(|_| OperationError::internal())?;
-                    if date.format("%Y-%m-%d").to_string() != text { return Err(OperationError::internal()); }
+                    if date.format("%Y-%m-%d").to_string() != text {
+                        return Err(OperationError::internal());
+                    }
                 }
                 Kind::Timestamp => {
-                    chrono::DateTime::parse_from_rfc3339(text).map_err(|_| OperationError::internal())?;
+                    chrono::DateTime::parse_from_rfc3339(text)
+                        .map_err(|_| OperationError::internal())?;
                 }
                 _ => {}
             }
@@ -560,7 +642,10 @@ fn encode_value(
 
 /// Quotes one SQL identifier after validating the generator-declared shape.
 pub fn quote(name: &str) -> Result<String, OperationError> {
-    let head = name.chars().next().map(|character| character.is_ascii_lowercase());
+    let head = name
+        .chars()
+        .next()
+        .map(|character| character.is_ascii_lowercase());
     let valid = head.unwrap_or(false)
         && name.len() <= 63
         && name.chars().enumerate().all(|(index, character)| {

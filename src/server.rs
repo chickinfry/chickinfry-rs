@@ -34,7 +34,9 @@ pub struct Secrets {
 
 impl Secrets {
     pub fn from_config() -> Secrets {
-        Secrets { values: crate::config().secrets.clone() }
+        Secrets {
+            values: crate::config().secrets.clone(),
+        }
     }
 
     pub fn get(&self, name: &str) -> Result<String, OperationError> {
@@ -118,12 +120,20 @@ impl OperationError {
         if !allowed {
             return Self::internal();
         }
-        OperationError { code: code.to_string(), status, database_code: None }
+        OperationError {
+            code: code.to_string(),
+            status,
+            database_code: None,
+        }
     }
 
     /// Generic internal failure. Internal details never reach the wire.
     pub fn internal() -> OperationError {
-        OperationError { code: "operation_failed".to_string(), status: 500, database_code: None }
+        OperationError {
+            code: "operation_failed".to_string(),
+            status: 500,
+            database_code: None,
+        }
     }
 
     pub fn unauthenticated() -> OperationError {
@@ -135,7 +145,10 @@ impl OperationError {
     }
 
     pub(crate) fn database(code: String) -> Self {
-        Self { database_code: Some(code), ..Self::internal() }
+        Self {
+            database_code: Some(code),
+            ..Self::internal()
+        }
     }
 
     pub(crate) fn unique_violation(&self) -> bool {
@@ -191,8 +204,12 @@ pub trait Application {
     const REQUIRES_DATABASE: bool;
     const EMAIL_PASSWORD_ENABLED: bool = false;
     const ALLOWED_ORIGINS: &'static [&'static str] = &[];
-    fn identity_providers(&self) -> &[Box<dyn crate::auth::IdentityProvider>] { &[] }
-    fn auth_hooks(&self) -> impl crate::auth::UserCreationHooks { crate::auth::NoHooks }
+    fn identity_providers(&self) -> &[Box<dyn crate::auth::IdentityProvider>] {
+        &[]
+    }
+    fn auth_hooks(&self) -> impl crate::auth::UserCreationHooks {
+        crate::auth::NoHooks
+    }
     async fn invoke(
         &self,
         context: &Self::Context,
@@ -236,7 +253,10 @@ struct ResponseEnvelope {
 }
 
 fn error_envelope(status: u16, code: &str) -> ResponseEnvelope {
-    ResponseEnvelope { status, body: serde_json::json!({ "error": code }) }
+    ResponseEnvelope {
+        status,
+        body: serde_json::json!({ "error": code }),
+    }
 }
 
 /// Serves one request frame. The engine glue supplies the request metadata and
@@ -246,22 +266,43 @@ pub async fn serve<A: Application>(
     metadata: Vec<u8>,
     body: Vec<u8>,
 ) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
-    let origin = serde_json::from_slice::<RequestMetadata>(&metadata).ok()
-        .and_then(|request| request.headers.into_iter().find(|(name, _)| name.eq_ignore_ascii_case("origin")))
+    let origin = serde_json::from_slice::<RequestMetadata>(&metadata)
+        .ok()
+        .and_then(|request| {
+            request
+                .headers
+                .into_iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("origin"))
+        })
         .map(|(_, value)| value);
     let envelope = match serve_inner(&application, metadata, body).await {
         Ok(envelope) => envelope,
         Err(status) => error_envelope(status, "operation_failed"),
     };
     let mut headers = serde_json::Map::new();
-    if A::REQUIRES_DATABASE && origin.as_deref().is_some_and(|origin| A::ALLOWED_ORIGINS.contains(&origin)) {
-        headers.insert("access-control-allow-origin".into(), serde_json::json!(origin));
+    if A::REQUIRES_DATABASE
+        && origin
+            .as_deref()
+            .is_some_and(|origin| A::ALLOWED_ORIGINS.contains(&origin))
+    {
+        headers.insert(
+            "access-control-allow-origin".into(),
+            serde_json::json!(origin),
+        );
         headers.insert("vary".into(), serde_json::json!("Origin"));
-        headers.insert("access-control-allow-methods".into(), serde_json::json!("POST"));
-        headers.insert("access-control-allow-headers".into(), serde_json::json!("content-type, authorization"));
+        headers.insert(
+            "access-control-allow-methods".into(),
+            serde_json::json!("POST"),
+        );
+        headers.insert(
+            "access-control-allow-headers".into(),
+            serde_json::json!("content-type, authorization"),
+        );
     }
-    let response = serde_json::json!({ "status": envelope.status, "body": envelope.body, "headers": headers });
-    serde_json::to_vec(&response).map_err(|_| wasm_bindgen::JsValue::from_str("response serialization failed"))
+    let response =
+        serde_json::json!({ "status": envelope.status, "body": envelope.body, "headers": headers });
+    serde_json::to_vec(&response)
+        .map_err(|_| wasm_bindgen::JsValue::from_str("response serialization failed"))
 }
 
 async fn serve_inner<A: Application>(
@@ -269,15 +310,24 @@ async fn serve_inner<A: Application>(
     metadata: Vec<u8>,
     body: Vec<u8>,
 ) -> Result<ResponseEnvelope, u16> {
-    let parsed: RequestMetadata =
-        serde_json::from_slice(&metadata).map_err(|_| 500u16)?;
-    let rid = parsed.id.unwrap_or_else(|| NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed));
-    let origin = parsed.headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("origin"));
-    if A::REQUIRES_DATABASE && origin.is_some_and(|(_, origin)| !A::ALLOWED_ORIGINS.contains(&origin.as_str())) {
+    let parsed: RequestMetadata = serde_json::from_slice(&metadata).map_err(|_| 500u16)?;
+    let rid = parsed
+        .id
+        .unwrap_or_else(|| NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed));
+    let origin = parsed
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("origin"));
+    if A::REQUIRES_DATABASE
+        && origin.is_some_and(|(_, origin)| !A::ALLOWED_ORIGINS.contains(&origin.as_str()))
+    {
         return Ok(error_envelope(403, "origin_denied"));
     }
     if A::REQUIRES_DATABASE && origin.is_some() && parsed.method == "OPTIONS" {
-        return Ok(ResponseEnvelope { status: 204, body: serde_json::Value::Null });
+        return Ok(ResponseEnvelope {
+            status: 204,
+            body: serde_json::Value::Null,
+        });
     }
     if body.len() > TOKEN_LIMIT {
         return Ok(error_envelope(413, "request_too_large"));
@@ -289,10 +339,12 @@ async fn serve_inner<A: Application>(
         Some(operation) if !operation.is_empty() => operation.to_string(),
         _ => return Ok(error_envelope(404, "not_found")),
     };
-    let builtin = A::REQUIRES_DATABASE && (
-        matches!(operation.as_str(), "auth.refresh" | "auth.session" | "auth.logout" | "auth.identity") ||
-        A::EMAIL_PASSWORD_ENABLED && matches!(operation.as_str(), "auth.signup" | "auth.signin")
-    );
+    let builtin = A::REQUIRES_DATABASE
+        && (matches!(
+            operation.as_str(),
+            "auth.refresh" | "auth.session" | "auth.logout" | "auth.identity"
+        ) || A::EMAIL_PASSWORD_ENABLED
+            && matches!(operation.as_str(), "auth.signup" | "auth.signin"));
     if !builtin && !application.accepts(&operation) {
         return Ok(error_envelope(404, "not_found"));
     }
@@ -311,22 +363,41 @@ async fn serve_inner<A: Application>(
         Ok(value) if value.is_object() => value,
         _ => return Ok(error_envelope(400, "invalid_input")),
     };
-    let authorization = parsed.headers.iter().find(|(key, _)| key.eq_ignore_ascii_case("authorization"));
+    let authorization = parsed
+        .headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("authorization"));
     let bearer = || -> Result<&str, OperationError> {
-        let value = authorization.map(|(_, value)| value.as_str()).ok_or_else(OperationError::invalid_token)?;
-        let (scheme, token) = value.split_once(' ').ok_or_else(OperationError::invalid_token)?;
-        if !scheme.eq_ignore_ascii_case("bearer") || token.len() != 43 ||
-            !token.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-') {
+        let value = authorization
+            .map(|(_, value)| value.as_str())
+            .ok_or_else(OperationError::invalid_token)?;
+        let (scheme, token) = value
+            .split_once(' ')
+            .ok_or_else(OperationError::invalid_token)?;
+        if !scheme.eq_ignore_ascii_case("bearer")
+            || token.len() != 43
+            || !token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        {
             return Err(OperationError::invalid_token());
         }
         Ok(token)
     };
-    let text = |key: &str| input.get(key).and_then(serde_json::Value::as_str)
-        .ok_or_else(|| OperationError::new("invalid_input", 400));
+    let text = |key: &str| {
+        input
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| OperationError::new("invalid_input", 400))
+    };
     let mut session = None;
     if A::REQUIRES_DATABASE {
         let hooks = application.auth_hooks();
-        let auth = match crate::auth::Auth::new(DatabasePort::new(rid), application.identity_providers(), &hooks) {
+        let auth = match crate::auth::Auth::new(
+            DatabasePort::new(rid),
+            application.identity_providers(),
+            &hooks,
+        ) {
             Ok(auth) => auth,
             Err(error) => return Ok(error_envelope(error.status, &error.code)),
         };
@@ -366,11 +437,17 @@ async fn serve_inner<A: Application>(
         query: parsed.query,
         headers: parsed.headers,
         session,
-        database: crate::config().database_url.as_ref().map(|_| DatabasePort::new(rid)),
+        database: crate::config()
+            .database_url
+            .as_ref()
+            .map(|_| DatabasePort::new(rid)),
     };
     let context = A::Context::build(&runtime);
     match application.invoke(&context, &operation, input).await {
-        Ok(output) => Ok(ResponseEnvelope { status: 200, body: output }),
+        Ok(output) => Ok(ResponseEnvelope {
+            status: 200,
+            body: output,
+        }),
         Err(DispatchError::InvalidInput(_)) => Ok(error_envelope(400, "invalid_input")),
         Err(DispatchError::Operation(error)) => Ok(error_envelope(error.status, &error.code)),
         Err(DispatchError::Internal) => Ok(error_envelope(500, "operation_failed")),

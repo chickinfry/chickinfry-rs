@@ -25,16 +25,45 @@ pub(crate) struct HostRequest<'a> {
 
 impl<'a> HostRequest<'a> {
     pub(crate) fn query(rid: u64, sql: &'a str, params: &'a [serde_json::Value]) -> Self {
-        Self { rid, op: "query", lease: None, sql: Some(sql), params: Some(params) }
+        Self {
+            rid,
+            op: "query",
+            lease: None,
+            sql: Some(sql),
+            params: Some(params),
+        }
     }
     pub(crate) fn begin(rid: u64) -> Self {
-        Self { rid, op: "begin", lease: None, sql: None, params: None }
+        Self {
+            rid,
+            op: "begin",
+            lease: None,
+            sql: None,
+            params: None,
+        }
     }
-    pub(crate) fn exec(rid: u64, lease: u64, sql: &'a str, params: &'a [serde_json::Value]) -> Self {
-        Self { rid, op: "exec", lease: Some(lease), sql: Some(sql), params: Some(params) }
+    pub(crate) fn exec(
+        rid: u64,
+        lease: u64,
+        sql: &'a str,
+        params: &'a [serde_json::Value],
+    ) -> Self {
+        Self {
+            rid,
+            op: "exec",
+            lease: Some(lease),
+            sql: Some(sql),
+            params: Some(params),
+        }
     }
     pub(crate) fn finish(rid: u64, op: &'static str, lease: u64) -> Self {
-        Self { rid, op, lease: Some(lease), sql: None, params: None }
+        Self {
+            rid,
+            op,
+            lease: Some(lease),
+            sql: None,
+            params: None,
+        }
     }
 }
 
