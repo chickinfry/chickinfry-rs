@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::{future::Future, pin::Pin};
 use subtle::ConstantTimeEq;
 
-// 옛 refresh 계열의 고정 저장 수명이 지나면 세션 만료 값과 무관하게 후보가 됩니다.
+// Legacy refresh families become cleanup candidates once their fixed storage lifetime has passed, regardless of the session expiry value.
 const LEGACY_REFRESH_LIFETIME_MILLIS: i64 = 604_800_000;
 
 #[derive(Clone)]
