@@ -104,6 +104,9 @@ pub trait SessionStore: Send + Sync + 'static {
     fn credentials(&self) -> SessionCredentials;
     /// Rotates credentials through `operation`; the store persists and returns
     /// the credentials it accepted.
+    /// Custom stores must preserve concurrent replacement or deletion: compare
+    /// the pre-refresh record and save atomically after the callback, without
+    /// holding the storage lock during network activity.
     /// Panic recovery requires unwinding; abort builds terminate, and the
     /// caller's panic hook still runs before recovery and may expose its payload.
     fn refresh(
@@ -111,7 +114,96 @@ pub trait SessionStore: Send + Sync + 'static {
         operation: &mut dyn FnMut(SessionCredentials) -> Result<SessionCredentials, ClientError>,
     ) -> Result<SessionCredentials, ClientError>;
     /// Clears the stored credentials only when they still equal `expected`.
+    /// Custom stores must compare and delete atomically under the same lock.
     fn clear(&self, expected: &SessionCredentials);
+}
+
+/// An origin-bound session store that keeps credentials in process memory.
+pub struct MemorySessionStore {
+    origin: String,
+    credentials: Mutex<Option<SessionCredentials>>,
+}
+
+impl MemorySessionStore {
+    /// Creates a store for one validated origin and credential pair.
+    pub fn new(origin: &str, credentials: Option<SessionCredentials>) -> Result<Self, ClientError> {
+        let store = Self {
+            origin: validate_origin(origin)?,
+            credentials: Mutex::new(None),
+        };
+        if let Some(credentials) = credentials {
+            store.write(credentials)?;
+        }
+        Ok(store)
+    }
+
+    /// Returns the stored record, or None after it has been cleared.
+    pub fn read(&self) -> Option<SessionCredentials> {
+        self.credentials.lock().expect("session store").clone()
+    }
+
+    /// Replaces the current record after validating its credential pair.
+    pub fn write(&self, credentials: SessionCredentials) -> Result<(), ClientError> {
+        if !valid_token(&credentials.access_token) || !valid_token(&credentials.refresh_token) {
+            return Err(ClientError::Protocol("invalid session credential".into()));
+        }
+        *self.credentials.lock().expect("session store") = Some(credentials);
+        Ok(())
+    }
+
+    /// Atomically clears only the expected record and returns whether it was removed.
+    pub fn clear(&self, expected: &SessionCredentials) -> bool {
+        #[cfg(feature = "conformance")]
+        conformance::emit(conformance::Event::SessionClearing);
+        let mut current = self.credentials.lock().expect("session store");
+        let matches = current.as_ref() == Some(expected);
+        #[cfg(all(test, feature = "conformance"))]
+        conformance::emit(conformance::Event::SessionClearCompared);
+        if matches {
+            current.take();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl SessionStore for MemorySessionStore {
+    fn bound_origin(&self) -> String {
+        self.origin.clone()
+    }
+    fn credentials(&self) -> SessionCredentials {
+        self.read().unwrap_or_else(|| SessionCredentials {
+            access_token: String::new(),
+            refresh_token: String::new(),
+            expires_at: String::new(),
+            refresh_expires_at: String::new(),
+            user_id: String::new(),
+            session_id: String::new(),
+        })
+    }
+    fn refresh(
+        &self,
+        operation: &mut dyn FnMut(SessionCredentials) -> Result<SessionCredentials, ClientError>,
+    ) -> Result<SessionCredentials, ClientError> {
+        let expected = self.read().ok_or_else(session_refresh_failed)?;
+        let refreshed = operation(expected.clone())?;
+        if !valid_token(&refreshed.access_token) || !valid_token(&refreshed.refresh_token) {
+            return Err(ClientError::Protocol("invalid session credential".into()));
+        }
+        let mut current = self.credentials.lock().expect("session store");
+        if current.as_ref() != Some(&expected) {
+            return Err(session_refresh_failed());
+        }
+        *current = Some(refreshed.clone());
+        drop(current);
+        #[cfg(feature = "conformance")]
+        conformance::emit(conformance::Event::SessionSaved);
+        Ok(refreshed)
+    }
+    fn clear(&self, expected: &SessionCredentials) {
+        self.clear(expected);
+    }
 }
 
 /// Shared client runtime behind generated Rust SDKs.
@@ -240,7 +332,7 @@ impl Client {
         #[cfg(feature = "conformance")]
         conformance::emit(conformance::Event::RefreshParticipation {
             leader,
-            refresh_token: refresh_token.clone(),
+            refresh_ref: Arc::as_ptr(&flight) as usize,
         });
         #[cfg(test)]
         if !leader && let Some(observer) = refreshes.joined.lock().expect("join observer").as_ref()
@@ -368,16 +460,44 @@ impl Client {
             request = request.header("authorization", format!("Bearer {token}"));
         }
         #[cfg(feature = "conformance")]
-        conformance::emit(conformance::Event::Sending);
+        conformance::emit(conformance::Event::Sending {
+            refresh: operation == REFRESH_OPERATION,
+        });
         let response = request
             .send(body)
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         let status = response.status().as_u16();
         #[cfg(feature = "conformance")]
         conformance::emit(conformance::Event::Response { status });
+        #[cfg(feature = "conformance")]
+        let retention = if self.origin.starts_with("http:") {
+            Some(256 << 10)
+        } else {
+            None
+        };
+        #[cfg(feature = "conformance")]
+        conformance::emit(conformance::Event::Transport {
+            phase: "headers",
+            bytes: 0,
+            retained: retention,
+        });
         if (300..400).contains(&status) {
             #[cfg(feature = "conformance")]
-            conformance::emit(conformance::Event::ResponseComplete);
+            conformance::emit(conformance::Event::Transport {
+                phase: "cancel-requested",
+                bytes: 0,
+                retained: Some(0),
+            });
+            drop(response);
+            #[cfg(feature = "conformance")]
+            {
+                conformance::emit(conformance::Event::Transport {
+                    phase: "reader-closed",
+                    bytes: 0,
+                    retained: Some(0),
+                });
+                conformance::emit(conformance::Event::ResponseComplete);
+            }
             return Err(ClientError::Operation(OperationError {
                 code: "redirect_not_allowed".into(),
                 status,
@@ -385,10 +505,24 @@ impl Client {
         }
         let reader = response.into_body().into_reader();
         let mut data = Vec::new();
-        reader
-            .take((MAX_RESPONSE_BYTES + 1) as u64)
-            .read_to_end(&mut data)
-            .map_err(|_| ClientError::Protocol("could not read operation response".into()))?;
+        let mut reader = reader.take((MAX_RESPONSE_BYTES + 1) as u64);
+        let result = read_response(&mut reader, &mut data);
+        #[cfg(feature = "conformance")]
+        if result.is_err() || data.len() > MAX_RESPONSE_BYTES {
+            conformance::emit(conformance::Event::Transport {
+                phase: "cancel-requested",
+                bytes: 0,
+                retained: Some(data.capacity()),
+            });
+        }
+        drop(reader);
+        #[cfg(feature = "conformance")]
+        conformance::emit(conformance::Event::Transport {
+            phase: "reader-closed",
+            bytes: 0,
+            retained: Some(data.capacity()),
+        });
+        result.map_err(|_| ClientError::Protocol("could not read operation response".into()))?;
         if data.len() > MAX_RESPONSE_BYTES {
             return Err(ClientError::Protocol(
                 "operation response is too large".into(),
@@ -438,6 +572,66 @@ impl Client {
             return Err(ClientError::Protocol("invalid session credential".into()));
         }
         Ok(())
+    }
+}
+
+// Preserve std 1.99's read_to_end growth and initialized-read sizes while exposing Vec capacity.
+fn read_response(reader: &mut impl Read, data: &mut Vec<u8>) -> std::io::Result<()> {
+    let mut probe = [0; 32];
+    let mut max_read = 8192usize;
+    let mut initialized = 0;
+    loop {
+        let length = data.len();
+        let result = if data.is_empty() {
+            reader.read(&mut probe).map(|count| {
+                data.extend_from_slice(&probe[..count]);
+                count
+            })
+        } else {
+            if data.capacity() - length < 32 {
+                data.try_reserve(32)?;
+                initialized = length;
+            }
+            let amount = if initialized > length + 32 {
+                initialized - length
+            } else {
+                max_read.min(data.capacity() - length)
+            };
+            // SAFETY: the previous initialized span is still valid after truncation.
+            unsafe {
+                data.set_len(initialized.min(length + amount).max(length));
+            }
+            data.resize(length + amount, 0);
+            let result = reader.read(&mut data[length..]);
+            data.truncate(length + result.as_ref().copied().unwrap_or(0));
+            initialized = length + amount;
+            result
+        };
+        let count = match result {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            other => other?,
+        };
+        #[cfg(feature = "conformance")]
+        if count > 0 {
+            conformance::emit(conformance::Event::Transport {
+                phase: "read",
+                bytes: count,
+                retained: Some(data.capacity()),
+            });
+            if data.len() > MAX_RESPONSE_BYTES {
+                conformance::emit(conformance::Event::Transport {
+                    phase: "limit",
+                    bytes: 0,
+                    retained: Some(data.capacity()),
+                });
+            }
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        if count == max_read {
+            max_read = max_read.saturating_mul(2);
+        }
     }
 }
 

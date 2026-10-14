@@ -40,6 +40,14 @@ The generated client exposes the same call as a typed method for every
 declared operation, so you pass a typed input struct and get a typed output
 struct back.
 
+`client::MemorySessionStore` keeps an optional session record for one origin in
+memory. Its `clear(expected)` compares and deletes under the same lock, so a
+late rejection cannot remove a newer login. Custom `client::SessionStore`
+implementations must also make this comparison and deletion atomic.
+Refresh compares the original record before saving a successful response and
+preserves concurrent replacement or deletion. Custom stores must do the same,
+without holding a storage lock during network activity.
+
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE).

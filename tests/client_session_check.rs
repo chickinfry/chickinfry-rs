@@ -192,7 +192,7 @@ fn refreshes_once_and_retries_original() {
         assert_eq!(
             events
                 .iter()
-                .filter(|e| matches!(e, Event::Sending))
+                .filter(|e| matches!(e, Event::Sending { .. }))
                 .count(),
             3
         );

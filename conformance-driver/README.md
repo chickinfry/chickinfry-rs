@@ -53,16 +53,79 @@ Standalone diagnostic launches may omit both arguments.
 
 ## Protocol and current limitations
 
-Execution JSON uses schema version 2 and its required `fixture` map; there is no
-driver fixture environment variable or argument. The current coordinator creates
-a new fixture project and driver process per case, sets its working directory,
-and sends only the target in handshake. It does not convey a plain/auth selector
-to the driver. Until that contract exists, C-08, C-09 and C-10 explicitly return
-`unimplemented`. The auth alias is declared but no fixture is inferred from a store,
-working directory, filename or SDK path. Plain `probe.echo` retains its generated
-typed call; list and explicit auth operations remain `unimplemented`.
-Schema version 3 will select the SDK through `client.create.fixture`
-(`plain` or `auth`), as confirmed in decision 6157261468.
+Execution specifications, suites and result rows use schema version 3; the
+process protocol remains version 1. The coordinator rejects version 2 inputs
+and evidence. Each `client.create` must provide `fixture: "plain"` or `"auth"`;
+missing, unknown or mistyped selectors return `invalid_args`. Copies retain the
+source fixture. Both bridges call the corresponding generated typed SDK.
+The driver connects the fixture's probe operations and the auth fixture's
+signup, signin, identity, refresh, session and logout operations.
+
+With SDKs and `conformance`, the handshake advertises `client.create`,
+`client.copy`, `client.call`, `session.store`, `barrier`, `session.trace` and
+`client.transport`. `client.observe` returns the exact eight-field events and
+a global sequence watermark, including while SDK calls are pending. Reads are
+published from each HTTP exchange; stored-session calls project only the final
+exchange's headers and closure at selection time; the first excessive read
+is immediately followed by its limit event. The completion event
+is emitted once after the generated SDK returns. A watermark selects an interval,
+not a promise that the SDK call has completed.
+
+Barriers observe actual runtime entry, original 401 rejection, and both leader
+and follower joining the same refresh flight. The follower waits at the runtime
+flight join. The leader reports that same actual flight at the transport
+response-wait entry, after its refresh request has been sent: the shared
+coordinator releases `refresh-joined` only after the peer observes
+`refresh-started` (coordinator README, C-09/C-10; `run/concurrent.go:190`).
+Holding the leader before sending would prevent that peer observation.
+The driver adds no refresh lock
+or uncertain-result gate. Session records come from the protected pipe, with
+all seven fields checked against the declared origin and credential references.
+`session.store.create` also accepts an origin-bound empty store when all three
+record/access/refresh references are absent; partial reference groups are invalid.
+The driver delegates storage and atomic expected-credential clearing to the
+runtime's public `MemorySessionStore`. It adds only revision and trace records
+around the runtime store operations; the trace records each actual invocation with `expectedAccessRef`, `expectedRefreshRef` and `removed`.
+The driver does not make an extra clear call when the runtime declines deletion.
+`input`/`inputRefs` conflicts are rejected even when the literal is null.
+
+SDK errors carry a boolean measured against the actual public error's code or
+message in memory; raw exception strings never cross the protocol. Unknown
+transport exception messages are reported as `rawTransportDetails: true`, so a
+runtime leak fails rather than being hidden by driver sanitization. Tool errors
+have null status and outcome, and omit that SDK measurement. Constructor counts
+observe entry into HTTP send and resolver functions without making a request.
+
+### Response retention and transport scope
+
+Native transport is pinned to `ureq 3.4.2` and `ureq-proto 0.6.4`. It uses HTTP/1.1
+only; there is no HTTP/2 negotiation or receive window. The shared loopback peer
+uses plain HTTP. TLS internal retention has not been established: a TLS exchange
+reports null retained measurements and an incomplete snapshot, never a passing
+retention bound. Remote HTTPS support requires separate verification.
+
+For the plain HTTP path, the body-proportional component is the receiving Vec's
+actual capacity, observed immediately after each read. The standard initialized
+read sizes, 32-byte growth threshold and Vec allocation pattern are preserved
+for Rust 1.99.0, and tested against its `Read::read_to_end` implementation.
+The retained sum also includes the fixed library buffers below. No library I/O
+buffer is excluded as transient: their combined 262144 bytes exceed 65536.
+Header-time redirect rejection allocates no receiving body Vec and drops the
+real response immediately. Cancellation is observed after the underlying
+transport has been dropped, and reader closure is recorded separately.
+
+| Pinned source | Allocation | Why it does not grow with this response body |
+| --- | --- | --- |
+| `ureq 3.4.2/src/config.rs:959-960` | input 131072 + output 131072 bytes | Fixed defaults; the driver does not resize them to pass |
+| `ureq 3.4.2/src/unversioned/transport/tcp.rs:45-46` | One pair of `LazyBuffers` per TCP transport | Uses those configuration sizes |
+| `ureq 3.4.2/src/unversioned/transport/buf.rs:96-101` | Lazy input/output allocations | Resizes to the configured fixed size |
+| `ureq 3.4.2/src/unversioned/transport/buf.rs:120-136` | Request scratch reuses input | The shared peer waits for the request; its response cannot accumulate during `Await100` |
+| `ureq 3.4.2/src/run.rs:630-707` | Decodes into the supplied receiving slice | Consumes input incrementally; no response-sized intermediate Vec |
+| `ureq 3.4.2/src/unversioned/transport/mod.rs:1-8` | HTTP/1.1 transport | No HTTP/2 prebuffer or receive window |
+
+These references describe the measured shared-peer path, not an unverified TLS,
+compressed, proxy or unsolicited early-response path. Additional library buffers
+on such a path must be measured or proven before using its retention evidence.
 
 Initial credentials arrive only through inherited anonymous pipe fd 3 as JSON
 Lines containing exactly string `ref` and `value`. Each line, including LF, is

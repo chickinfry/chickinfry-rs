@@ -187,10 +187,20 @@ fn run_ids_unknown_fields_and_unregistered_responses_are_violations() {
 fn credentials_are_pipe_only_and_stores_expose_references_and_revisions() {
     let access = "A".repeat(43);
     let refresh = "B".repeat(43);
+    let record = |access: &str, refresh: &str| {
+        json!({
+            "origin":"http://127.0.0.1:9","access_token":access,"refresh_token":refresh,
+            "expires_at":"2099-01-01T00:00:00Z","refresh_expires_at":"2099-01-08T00:00:00Z",
+            "user_id":"user","session_id":"session",
+        })
+        .to_string()
+    };
     let secrets = format!(
-        "{}\n{}\n",
+        "{}\n{}\n{}\n{}\n",
         json!({"ref":"access","value":access}),
-        json!({"ref":"refresh","value":refresh})
+        json!({"ref":"refresh","value":refresh}),
+        json!({"ref":"record","value":record(&access, &refresh)}),
+        json!({"ref":"replacement","value":record(&refresh, &access)}),
     );
     let (outcome, responses, bytes) = execute(
         &[
@@ -198,7 +208,7 @@ fn credentials_are_pipe_only_and_stores_expose_references_and_revisions() {
             command(
                 "c:create",
                 "session.store.create",
-                json!({"storeRef":"store","accessRef":"access","refreshRef":"refresh"}),
+                json!({"storeRef":"store","origin":"http://127.0.0.1:9","recordRef":"record","accessRef":"access","refreshRef":"refresh"}),
             ),
             command(
                 "c:read",
@@ -208,7 +218,7 @@ fn credentials_are_pipe_only_and_stores_expose_references_and_revisions() {
             command(
                 "c:write",
                 "session.store.write",
-                json!({"storeRef":"store","accessRef":"refresh","refreshRef":"access"}),
+                json!({"storeRef":"store","recordRef":"replacement","accessRef":"refresh","refreshRef":"access"}),
             ),
             command(
                 "c:read-again",
@@ -220,7 +230,7 @@ fn credentials_are_pipe_only_and_stores_expose_references_and_revisions() {
     );
     assert!(outcome.is_ok());
     assert_eq!(responses[2]["result"]["accessRef"], "access");
-    assert_eq!(responses[4]["result"]["revision"], 2);
+    assert_eq!(responses[4]["result"]["revision"], 3);
     assert_eq!(responses[4]["result"]["accessRef"], "refresh");
     let text = String::from_utf8(bytes).unwrap();
     assert!(!text.contains(&access) && !text.contains(&refresh));
@@ -239,12 +249,12 @@ fn unavailable_operations_are_not_success_or_advertised_support() {
             command(
                 "c:create",
                 "client.create",
-                json!({"clientRef":"client","origin":"http://127.0.0.1:9","requestTimeoutMs":10}),
+                json!({"fixture":"plain","clientRef":"client","origin":"http://127.0.0.1:9","requestTimeoutMs":10}),
             ),
             command(
                 "c:list",
                 "client.call",
-                json!({"clientRef":"client","operation":"probe.list","input":{}}),
+                json!({"clientRef":"client","operation":"probe.unknown","input":{}}),
             ),
             command("c:unknown", "peer.start", json!({})),
         ],
@@ -258,18 +268,133 @@ fn unavailable_operations_are_not_success_or_advertised_support() {
 }
 
 #[test]
-fn auth_fixture_cases_are_explicitly_unimplemented_without_fixture_selection() {
-    for case_id in ["C-08", "C-09", "C-10"] {
-        let mut create = command(
-            "c:auth",
-            "client.create",
-            json!({"clientRef":"auth","origin":"http://127.0.0.1:9","requestTimeoutMs":10}),
-        );
-        create["args"]["caseId"] = json!(case_id);
+fn fixture_selection_is_explicit_and_rejects_missing_unknown_and_wrong_types() {
+    for (fixture, expected) in [
+        (Some(json!("plain")), None),
+        (Some(json!("auth")), None),
+        (None, Some("invalid_args")),
+        (Some(json!("unknown")), Some("invalid_args")),
+        (Some(Value::Null), Some("invalid_args")),
+        (Some(json!(7)), Some("invalid_args")),
+    ] {
+        let mut args =
+            json!({"clientRef":"client","origin":"http://127.0.0.1:9","requestTimeoutMs":10});
+        if let Some(fixture) = fixture {
+            args["fixture"] = fixture;
+        }
+        let create = command("c:create", "client.create", args);
         let (outcome, responses, _) = execute(&[handshake(), create], b"");
         assert!(outcome.is_ok());
-        assert_eq!(responses[1]["error"]["kind"], "unimplemented");
-        assert!(responses[1]["result"].is_null());
+        assert_eq!(responses[1]["error"]["code"].as_str(), expected);
+        if expected.is_none() {
+            assert_eq!(responses[1]["result"]["constructorNetworkRequests"], 0);
+        }
+    }
+}
+
+#[test]
+fn new_commands_reject_invalid_types_without_advertising_partial_observations() {
+    for (command_name, args) in [
+        (
+            "client.observe",
+            json!({"callId":"c:call","afterSequence":-1}),
+        ),
+        (
+            "client.observe",
+            json!({"callId":"c:call","afterSequence":null}),
+        ),
+        ("client.observe", json!({"callId":7,"afterSequence":0})),
+        (
+            "session.store.read",
+            json!({"storeRef":"missing","includeTrace":"true"}),
+        ),
+        (
+            "session.store.create",
+            json!({"storeRef":"store","origin":7,"recordRef":"record","accessRef":"access","refreshRef":"refresh"}),
+        ),
+    ] {
+        let (_, responses, _) = execute(&[handshake(), command("c:bad", command_name, args)], b"");
+        assert_eq!(responses[1]["error"]["code"], "invalid_args");
+        assert!(responses[1]["error"]["outcomeUnknown"].is_null());
+        assert!(responses[1]["error"].get("rawTransportDetails").is_none());
+    }
+}
+
+#[test]
+fn empty_stores_keep_the_origin_and_partial_record_reference_groups_are_rejected() {
+    let (outcome, responses, _) = execute(
+        &[
+            handshake(),
+            command(
+                "c:empty",
+                "session.store.create",
+                json!({"storeRef":"empty","origin":"http://127.0.0.1:9"}),
+            ),
+            command(
+                "c:read",
+                "session.store.read",
+                json!({"storeRef":"empty","includeTrace":false}),
+            ),
+        ],
+        b"",
+    );
+    assert!(outcome.is_ok());
+    assert!(responses[1]["error"].is_null());
+    assert_eq!(
+        responses[2]["result"],
+        json!({"present":false,"revision":1,"accessRef":null,"refreshRef":null})
+    );
+    for mask in 1..7 {
+        let mut args = json!({"storeRef":"partial","origin":"http://127.0.0.1:9"});
+        for (index, field) in ["recordRef", "accessRef", "refreshRef"]
+            .into_iter()
+            .enumerate()
+        {
+            if mask & (1 << index) != 0 {
+                args[field] = json!("reference");
+            }
+        }
+        let (_, responses, _) = execute(
+            &[
+                handshake(),
+                command("c:partial", "session.store.create", args),
+            ],
+            b"",
+        );
+        assert_eq!(responses[1]["error"]["code"], "invalid_args");
+    }
+}
+
+#[test]
+fn trailing_slash_origins_accept_complete_records_and_empty_store_writes() {
+    let origin = "http://127.0.0.1:9/";
+    let secrets = format!(
+        "{}\n{}\n{}\n",
+        json!({"ref":"access","value":"H".repeat(43)}),
+        json!({"ref":"refresh","value":"I".repeat(43)}),
+        json!({"ref":"record","value":json!({
+            "origin":origin,"access_token":"H".repeat(43),"refresh_token":"I".repeat(43),
+            "expires_at":"2099-01-01T00:00:00Z","refresh_expires_at":"2099-01-08T00:00:00Z",
+            "user_id":"user","session_id":"session"}).to_string()})
+    );
+    for complete in [true, false] {
+        let mut create = json!({"storeRef":"store","origin":origin});
+        if complete {
+            create["recordRef"] = json!("record");
+            create["accessRef"] = json!("access");
+            create["refreshRef"] = json!("refresh");
+        }
+        let mut messages = vec![
+            handshake(),
+            command("c:store", "session.store.create", create),
+        ];
+        if !complete {
+            messages.push(command("c:write", "session.store.write", json!({"storeRef":"store","recordRef":"record","accessRef":"access","refreshRef":"refresh"})));
+        }
+        messages.push(command("c:create", "client.create", json!({"fixture":"auth","clientRef":"client","origin":origin,"storeRef":"store","requestTimeoutMs":10})));
+        let (outcome, responses, _) = execute(&messages, secrets.as_bytes());
+        assert!(outcome.is_ok());
+        assert!(responses.iter().all(|response| response["error"].is_null()));
     }
 }
 
@@ -298,6 +423,7 @@ fn build_without_sdk_observation_has_no_barrier_or_session_trace() {
         !caps.contains(&json!("session.trace"))
             && !caps.contains(&json!("barrier"))
             && !caps.contains(&json!("client.call"))
+            && !caps.contains(&json!("client.transport"))
     );
     for response in &responses[1..] {
         assert_eq!(response["error"]["code"], "unimplemented");

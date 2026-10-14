@@ -13,7 +13,11 @@ pub struct Error {
     pub kind: String,
     pub code: Option<String>,
     pub http_status: Option<u16>,
-    pub outcome_unknown: bool,
+    pub outcome_unknown: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_transport_details: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constructor_network_requests: Option<u64>,
 }
 
 impl Error {
@@ -27,7 +31,9 @@ impl Error {
             .into(),
             code: Some(code.into()),
             http_status: None,
-            outcome_unknown: false,
+            outcome_unknown: None,
+            raw_transport_details: None,
+            constructor_network_requests: None,
         }
     }
 }

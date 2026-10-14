@@ -7,6 +7,10 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+#[cfg(all(feature = "conformance", feature = "sdk"))]
+#[path = "../../tests/common/mod.rs"]
+mod common;
+
 unsafe extern "C" {
     fn pipe(fds: *mut i32) -> i32;
     fn dup2(old: i32, new: i32) -> i32;
@@ -134,7 +138,7 @@ fn malformed_control_and_credential_pipes_never_expose_raw_values() {
     driver.request(
         "c:raw",
         "client.create",
-        json!({"clientRef":"client","origin":secret,"bearerRef":"access","requestTimeoutMs":10}),
+        json!({"fixture":"plain","clientRef":"client","origin":secret,"bearerRef":"access","requestTimeoutMs":10}),
     );
     let response = driver.next();
     assert_eq!(response["error"]["kind"], "sdk");
@@ -161,6 +165,195 @@ fn malformed_control_and_credential_pipes_never_expose_raw_values() {
 }
 
 #[cfg(all(feature = "conformance", feature = "sdk"))]
+fn record(origin: &str, access: &str, refresh: &str) -> String {
+    format!(
+        "{}\n",
+        json!({"ref":"record", "value":json!({
+        "origin":origin, "access_token":access, "refresh_token":refresh,
+        "expires_at":"2099-01-01T00:00:00Z", "refresh_expires_at":"2099-01-08T00:00:00Z",
+        "user_id":"user", "session_id":"session",
+    }).to_string()})
+    )
+}
+
+#[cfg(all(feature = "conformance", feature = "sdk"))]
+#[test]
+fn auth_selector_calls_generated_methods_and_keeps_credentials_in_the_pipe() {
+    let access = "J".repeat(43);
+    let refresh = "K".repeat(43);
+    let issued = json!({"access_token":access,"refresh_token":refresh,
+        "expires_at":"2099-01-01T00:00:00Z","refresh_expires_at":"2099-01-08T00:00:00Z",
+        "user_id":"user","session_id":"session"})
+    .to_string();
+    let mut replies = vec![common::response("HTTP/1.1 200 OK", &issued); 4];
+    replies.push(common::response(
+        "HTTP/1.1 200 OK",
+        r#"{"id":"user","email":"hidden@example.invalid","session_id":"session"}"#,
+    ));
+    replies.push(common::response("HTTP/1.1 200 OK", r#"{"status":"ok"}"#));
+    let (origin, requests) = common::serve(&replies);
+    let secrets = [
+        ("access", access.as_str()),
+        ("refresh", refresh.as_str()),
+        ("email", "hidden@example.invalid"),
+        ("password", "private password canary"),
+        ("credential", "private identity credential canary"),
+    ]
+    .into_iter()
+    .map(|(reference, value)| format!("{}\n", json!({"ref":reference,"value":value})))
+    .collect::<String>();
+    let mut driver = Driver::start(secrets.as_bytes());
+    driver.hello();
+    for fixture in ["plain", "auth"] {
+        driver.request(
+            &format!("c:create-{fixture}"),
+            "client.create",
+            json!({"clientRef":fixture,"fixture":fixture,"origin":origin,"requestTimeoutMs":1000}),
+        );
+        assert!(driver.next()["error"].is_null());
+    }
+    driver.request("c:plain-auth", "client.call", json!({"clientRef":"plain","operation":"auth.refresh","input":{},"inputRefs":{"refresh_token":"refresh"}}));
+    assert_eq!(driver.next()["error"]["kind"], "unimplemented");
+    driver.request("c:conflict", "client.call", json!({"clientRef":"auth","operation":"auth.refresh","input":{"refresh_token":null},"inputRefs":{"refresh_token":"refresh"}}));
+    assert_eq!(driver.next()["error"]["code"], "invalid_args");
+    for (index, (operation, input, refs)) in [
+        (
+            "auth.signup",
+            json!({}),
+            json!({"email":"email","password":"password"}),
+        ),
+        (
+            "auth.signin",
+            json!({}),
+            json!({"email":"email","password":"password"}),
+        ),
+        (
+            "auth.identity",
+            json!({"provider":"fixture"}),
+            json!({"credential":"credential"}),
+        ),
+        (
+            "auth.refresh",
+            json!({}),
+            json!({"refresh_token":"refresh"}),
+        ),
+        ("auth.session", json!({}), json!({})),
+        ("auth.logout", json!({}), json!({})),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        driver.request(
+            &format!("c:auth-{index}"),
+            "client.call",
+            json!({"clientRef":"auth","operation":operation,"input":input,"inputRefs":refs}),
+        );
+        let response = driver.next();
+        assert!(response["error"].is_null());
+        if index < 4 {
+            assert_eq!(
+                response["result"]["credentialRefs"],
+                json!({"access_token":"access","refresh_token":"refresh"})
+            );
+            assert!(response["result"]["output"].get("access_token").is_none());
+            assert!(response["result"]["output"].get("refresh_token").is_none());
+        }
+        let actual = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(actual.path, format!("/{operation}"));
+        assert!(actual.authorization.is_none());
+        let actual: Value = serde_json::from_str(&actual.body).unwrap();
+        if index < 2 {
+            assert!(actual["email"] == "hidden@example.invalid");
+            assert!(actual["password"] == "private password canary");
+        } else if index == 2 {
+            assert!(actual["credential"] == "private identity credential canary");
+        } else if index == 3 {
+            assert!(actual["refresh_token"] == refresh);
+        }
+    }
+    let output = String::from_utf8(driver.observed.clone()).unwrap();
+    for secret in [
+        access.as_str(),
+        refresh.as_str(),
+        "private password canary",
+        "private identity credential canary",
+    ] {
+        assert!(!output.contains(secret));
+    }
+}
+
+#[cfg(all(feature = "conformance", feature = "sdk"))]
+#[test]
+fn session_overflow_limits_follow_the_first_excessive_read_in_each_exchange() {
+    let large =
+        json!({"wire_value":"x".repeat(1048577),"observed_at":"2099-01-01T00:00:00Z"}).to_string();
+    let rejected = common::response("HTTP/1.1 401 Unauthorized", r#"{"error":"invalid_token"}"#);
+    let access = "R".repeat(43);
+    let refresh = "S".repeat(43);
+    let issued = json!({"access_token":"T".repeat(43),"refresh_token":"U".repeat(43),
+        "expires_at":"2099-01-01T00:00:00Z","refresh_expires_at":"2099-01-08T00:00:00Z",
+        "user_id":"user","session_id":"session"})
+    .to_string();
+    for responses in [
+        vec![common::response("HTTP/1.1 200 OK", &large)],
+        vec![
+            rejected.clone(),
+            common::response("HTTP/1.1 200 OK", &large),
+        ],
+        vec![
+            rejected.clone(),
+            common::response("HTTP/1.1 200 OK", &issued),
+            common::response("HTTP/1.1 200 OK", &large),
+        ],
+    ] {
+        let exchanges = responses.len();
+        let (origin, requests) = common::serve(&responses);
+        let mut secrets = format!(
+            "{}\n{}\n{}",
+            json!({"ref":"access","value":access}),
+            json!({"ref":"refresh","value":refresh}),
+            record(&origin, &access, &refresh)
+        );
+        for (reference, value) in [
+            ("nextAccess", "T".repeat(43)),
+            ("nextRefresh", "U".repeat(43)),
+        ] {
+            secrets += &format!("{}\n", json!({"ref":reference,"value":value}));
+        }
+        let mut driver = Driver::start(secrets.as_bytes());
+        driver.hello();
+        driver.request("c:store", "session.store.create", json!({"storeRef":"store","origin":origin,"recordRef":"record","accessRef":"access","refreshRef":"refresh"}));
+        assert!(driver.next()["error"].is_null());
+        driver.request("c:create", "client.create", json!({"fixture":"auth","clientRef":"client","origin":origin,"storeRef":"store","requestTimeoutMs":1000}));
+        assert!(driver.next()["error"].is_null());
+        driver.request(
+            "c:call",
+            "client.call",
+            json!({"clientRef":"client","operation":"probe.echo","input":{"wire_value":"ok"}}),
+        );
+        assert_eq!(driver.next()["error"]["kind"], "sdk");
+        driver.request(
+            "c:observe",
+            "client.observe",
+            json!({"callId":"c:call","afterSequence":0}),
+        );
+        let snapshot = driver.next()["result"].clone();
+        assert_eq!(snapshot["complete"], true);
+        let events = snapshot["events"].as_array().unwrap();
+        let limit = events
+            .iter()
+            .position(|event| event["phase"] == "limit")
+            .unwrap();
+        assert_eq!(events[limit - 1]["phase"], "read");
+        assert_eq!(events[limit]["readBytes"], events[limit - 1]["readBytes"]);
+        assert!(events[limit - 1]["readBytes"].as_u64().unwrap() > 1048576);
+        for _ in 0..exchanges {
+            requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+    }
+}
+
+#[cfg(all(feature = "conformance", feature = "sdk"))]
 #[test]
 fn diagnostic_two_actual_sdk_entries_and_store_reads_progress_while_first_call_is_held() {
     use std::net::TcpListener;
@@ -169,23 +362,24 @@ fn diagnostic_two_actual_sdk_entries_and_store_reads_progress_while_first_call_i
     let access = "A".repeat(43);
     let refresh = "B".repeat(43);
     let secrets = format!(
-        "{}\n{}\n",
+        "{}\n{}\n{}",
         json!({"ref":"access","value":access}),
-        json!({"ref":"refresh","value":refresh})
+        json!({"ref":"refresh","value":refresh}),
+        record(&origin, &access, &refresh)
     );
     let mut driver = Driver::start(secrets.as_bytes());
     driver.hello();
     driver.request(
         "c:store",
         "session.store.create",
-        json!({"storeRef":"store","accessRef":"access","refreshRef":"refresh"}),
+        json!({"storeRef":"store","origin":origin,"recordRef":"record","accessRef":"access","refreshRef":"refresh"}),
     );
     assert!(driver.next()["error"].is_null());
     for (id, client) in [("c:create-first", "first"), ("c:create-second", "second")] {
         driver.request(
             id,
             "client.create",
-            json!({"clientRef":client,"origin":origin,"storeRef":"store","requestTimeoutMs":1000}),
+            json!({"fixture":"plain","clientRef":client,"origin":origin,"storeRef":"store","requestTimeoutMs":1000}),
         );
         assert!(driver.next()["error"].is_null());
     }
@@ -203,6 +397,15 @@ fn diagnostic_two_actual_sdk_entries_and_store_reads_progress_while_first_call_i
     let first = driver.next();
     assert_eq!(first["command"], "barrier.arrive");
     assert_eq!(first["args"]["callId"], "c:first");
+    assert_eq!(first["args"]["facts"], json!({"entered":true}));
+    driver.request(
+        "c:pending",
+        "client.observe",
+        json!({"callId":"c:first","afterSequence":0}),
+    );
+    let snapshot = driver.next();
+    assert_eq!(snapshot["result"]["complete"], true);
+    assert_eq!(snapshot["result"]["events"], json!([]));
     driver.request(
         "c:read",
         "session.store.read",
@@ -259,6 +462,29 @@ fn diagnostic_two_actual_sdk_entries_and_store_reads_progress_while_first_call_i
             "2026-01-02T03:04:05.123456Z"
         );
     }
+    let mut watermark = 0;
+    for (index, call_id) in ["c:first", "c:second"].into_iter().enumerate() {
+        driver.request(
+            &format!("c:observe-{index}"),
+            "client.observe",
+            json!({"callId":call_id,"afterSequence":0}),
+        );
+        let snapshot = driver.next()["result"].clone();
+        assert!(snapshot["throughSequence"].as_u64().unwrap() >= watermark);
+        watermark = snapshot["throughSequence"].as_u64().unwrap();
+        let events = snapshot["events"].as_array().unwrap();
+        assert!(events.iter().any(|event| event["phase"] == "read"));
+        assert_eq!(events.last().unwrap()["phase"], "completed");
+        for event in events {
+            assert_eq!(event.as_object().unwrap().len(), 8);
+        }
+        driver.request(
+            &format!("c:watermark-{index}"),
+            "client.observe",
+            json!({"callId":call_id,"afterSequence":watermark}),
+        );
+        assert_eq!(driver.next()["result"]["events"], json!([]));
+    }
     server.join().unwrap();
     assert!(
         !String::from_utf8(driver.observed.clone())
@@ -313,7 +539,7 @@ fn diagnostic_unregistered_refresh_credentials_never_reach_stdout_or_stderr() {
                 ),
                 1 => {
                     assert!(headers.starts_with("POST /auth.refresh "));
-                    assert_eq!(input["refresh_token"], "B".repeat(43));
+                    assert!(input["refresh_token"] == "B".repeat(43));
                     ("200 OK", rotated.clone())
                 }
                 _ => {
@@ -330,22 +556,23 @@ fn diagnostic_unregistered_refresh_credentials_never_reach_stdout_or_stderr() {
         }
     });
     let secrets = format!(
-        "{}\n{}\n",
+        "{}\n{}\n{}",
         json!({"ref":"access","value":access}),
-        json!({"ref":"refresh","value":refresh})
+        json!({"ref":"refresh","value":refresh}),
+        record(&origin, &access, &refresh)
     );
     let mut driver = Driver::start(secrets.as_bytes());
     driver.hello();
     driver.request(
         "c:store",
         "session.store.create",
-        json!({"storeRef":"store","accessRef":"access","refreshRef":"refresh"}),
+        json!({"storeRef":"store","recordRef":"record","accessRef":"access","refreshRef":"refresh","origin":origin}),
     );
     assert!(driver.next()["error"].is_null());
     driver.request(
         "c:create",
         "client.create",
-        json!({"clientRef":"client","origin":origin,"storeRef":"store","requestTimeoutMs":1000}),
+        json!({"fixture":"auth","clientRef":"client","origin":origin,"storeRef":"store","requestTimeoutMs":1000}),
     );
     assert!(driver.next()["error"].is_null());
     driver.request(
@@ -373,9 +600,9 @@ fn diagnostic_unregistered_refresh_credentials_never_reach_stdout_or_stderr() {
     driver.request(
         "c:replace",
         "session.store.write",
-        json!({"storeRef":"store","accessRef":"access","refreshRef":"refresh"}),
+        json!({"storeRef":"store","accessRef":"access","refreshRef":"refresh","recordRef":"record"}),
     );
-    assert_eq!(driver.next()["result"]["revision"], 3);
+    assert_eq!(driver.next()["result"]["revision"], 4);
     driver.request(
         "c:registered",
         "session.store.read",
@@ -450,13 +677,19 @@ fn diagnostic_sdk_errors_preserve_codes_status_and_transport_uncertainty() {
         driver.request(
             &format!("c:create-{name}"),
             "client.create",
-            json!({"clientRef":name,"origin":origin,"requestTimeoutMs":1000}),
+            json!({"fixture":"plain","clientRef":name,"origin":origin,"requestTimeoutMs":1000}),
         );
         assert!(driver.next()["error"].is_null());
     }
     for (id, client, code, status, unknown) in [
         ("conflict", "client", json!("conflict"), json!(409), false),
-        ("corrupt", "client", Value::Null, json!(200), false),
+        (
+            "corrupt",
+            "client",
+            json!("invalid_response"),
+            json!(200),
+            false,
+        ),
         ("disconnected", "client", Value::Null, Value::Null, true),
         ("refused", "refused", Value::Null, Value::Null, false),
     ] {
@@ -468,7 +701,7 @@ fn diagnostic_sdk_errors_preserve_codes_status_and_transport_uncertainty() {
         let response = driver.next();
         assert_eq!(
             response["error"],
-            json!({"kind":"sdk","code":code,"httpStatus":status,"outcomeUnknown":unknown})
+            json!({"kind":"sdk","code":code,"httpStatus":status,"outcomeUnknown":unknown,"rawTransportDetails":matches!(id, "disconnected" | "refused")})
         );
         assert!(response["result"].is_null());
     }
@@ -483,7 +716,7 @@ fn diagnostic_eof_cancels_an_observed_entry_without_waiting_for_release() {
     driver.request(
         "c:create",
         "client.create",
-        json!({"clientRef":"client","origin":"http://127.0.0.1:9","requestTimeoutMs":1000}),
+        json!({"fixture":"plain","clientRef":"client","origin":"http://127.0.0.1:9","requestTimeoutMs":1000}),
     );
     assert!(driver.next()["error"].is_null());
     driver.request(
@@ -511,13 +744,13 @@ fn diagnostic_eof_cancels_an_observed_entry_without_waiting_for_release() {
 
 #[cfg(all(feature = "conformance", feature = "sdk"))]
 #[test]
-fn diagnostic_inputs_unrepresentable_by_the_generated_type_are_unimplemented() {
+fn diagnostic_malformed_typed_inputs_are_invalid_args() {
     let mut driver = Driver::start(b"");
     driver.hello();
     driver.request(
         "c:create",
         "client.create",
-        json!({"clientRef":"client","origin":"http://127.0.0.1:9","requestTimeoutMs":1000}),
+        json!({"fixture":"plain","clientRef":"client","origin":"http://127.0.0.1:9","requestTimeoutMs":1000}),
     );
     assert!(driver.next()["error"].is_null());
     for (index, input) in [
@@ -535,8 +768,8 @@ fn diagnostic_inputs_unrepresentable_by_the_generated_type_are_unimplemented() {
             json!({"clientRef":"client","operation":"probe.echo","input":input}),
         );
         let response = driver.next();
-        assert_eq!(response["error"]["kind"], "unimplemented");
-        assert_eq!(response["error"]["code"], "unimplemented");
+        assert_eq!(response["error"]["kind"], "driver");
+        assert_eq!(response["error"]["code"], "invalid_args");
         assert!(response["error"]["httpStatus"].is_null());
     }
 }
