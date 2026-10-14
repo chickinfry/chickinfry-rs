@@ -1,0 +1,13 @@
+{
+  "protocolVersion": 1,
+  "driverVersion": "0.1.0",
+  "driverCommit": "DRIVER_COMMIT",
+  "build": {
+    "tool": "cargo",
+    "entry": "conformance-driver/Cargo.toml",
+    "features": []
+  },
+  "executable": "artifacts/debug/chickinfry-conformance-driver",
+  "run": null,
+  "files": []
+}

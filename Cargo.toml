@@ -2,6 +2,7 @@
 name = "chickinfry"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.99"
 license = "Apache-2.0"
 description = "Native Rust runtime for Chickinfry"
 repository = "https://github.com/chickinfry/chickinfry-rs"
@@ -9,6 +10,9 @@ publish = false
 
 [lib]
 crate-type = ["rlib", "cdylib"]
+
+[features]
+conformance = []
 
 [dependencies]
 js-sys = "0.3"

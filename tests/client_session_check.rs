@@ -156,9 +156,47 @@ fn refreshes_once_and_retries_original() {
         .with_session(store.clone())
         .expect("valid session");
 
-    let value = client
-        .invoke("catalog.find", &json!({ "id": "one" }))
-        .expect("retried call");
+    #[cfg(feature = "conformance")]
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let invoke = || client.invoke("catalog.find", &json!({ "id": "one" }));
+    #[cfg(feature = "conformance")]
+    let result = client::conformance::observe(
+        Arc::new({
+            let events = events.clone();
+            move |event| events.lock().unwrap().push(event)
+        }),
+        invoke,
+    );
+    #[cfg(not(feature = "conformance"))]
+    let result = invoke();
+    let value = result.expect("retried call");
+    #[cfg(feature = "conformance")]
+    {
+        use client::conformance::Event;
+        let events = events.lock().unwrap();
+        assert!(matches!(events[0], Event::Entered));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::OriginalRejected { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::RefreshParticipation { leader: true, .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::Sending))
+                .count(),
+            3
+        );
+    }
     assert_eq!(value, json!({ "ok": true }));
 
     let first = receiver.recv().expect("original request");

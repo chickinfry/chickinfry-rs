@@ -25,6 +25,11 @@ const MAX_REQUEST_BYTES: usize = 4 << 20;
 const MAX_RESPONSE_BYTES: usize = 1 << 20;
 const REFRESH_OPERATION: &str = "auth.refresh";
 
+#[cfg(feature = "conformance")]
+#[path = "client/conformance.rs"]
+#[doc(hidden)]
+pub mod conformance;
+
 /// A server-reported operation failure with its error code and HTTP status.
 #[derive(Clone, Debug)]
 pub struct OperationError {
@@ -132,13 +137,16 @@ impl Client {
             ));
         }
         let origin = validate_origin(origin)?;
-        let agent: ureq::Agent = ureq::config::Config::builder()
+        let config = ureq::config::Config::builder()
             .max_redirects(0)
             .max_redirects_will_error(false)
             .http_status_as_error(false)
             .timeout_global(Some(timeout))
-            .build()
-            .into();
+            .build();
+        #[cfg(feature = "conformance")]
+        let agent = conformance::agent(config);
+        #[cfg(not(feature = "conformance"))]
+        let agent: ureq::Agent = config.into();
         Ok(Self {
             agent,
             origin,
@@ -176,6 +184,8 @@ impl Client {
 
     /// Invokes one declared operation and returns the JSON response value.
     pub fn invoke(&self, operation: &str, input: &Value) -> Result<Value, ClientError> {
+        #[cfg(feature = "conformance")]
+        conformance::emit(conformance::Event::Entered);
         let Some(store) = self.session.as_ref() else {
             return self.invoke_once(operation, input, self.bearer.as_deref(), None);
         };
@@ -191,6 +201,10 @@ impl Client {
             Err(ClientError::Operation(OperationError { code, status: 401 }))
                 if operation != REFRESH_OPERATION && code == "invalid_token" =>
             {
+                #[cfg(feature = "conformance")]
+                conformance::emit(conformance::Event::OriginalRejected {
+                    access_token: credentials.access_token.clone(),
+                });
                 let credentials = self.refresh_session(store, &credentials.access_token)?;
                 self.invoke_once(operation, input, Some(&credentials.access_token), None)
             }
@@ -223,6 +237,11 @@ impl Client {
                 }
             }
         };
+        #[cfg(feature = "conformance")]
+        conformance::emit(conformance::Event::RefreshParticipation {
+            leader,
+            refresh_token: refresh_token.clone(),
+        });
         #[cfg(test)]
         if !leader && let Some(observer) = refreshes.joined.lock().expect("join observer").as_ref()
         {
@@ -348,11 +367,17 @@ impl Client {
         if let Some(token) = bearer {
             request = request.header("authorization", format!("Bearer {token}"));
         }
+        #[cfg(feature = "conformance")]
+        conformance::emit(conformance::Event::Sending);
         let response = request
             .send(body)
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         let status = response.status().as_u16();
+        #[cfg(feature = "conformance")]
+        conformance::emit(conformance::Event::Response { status });
         if (300..400).contains(&status) {
+            #[cfg(feature = "conformance")]
+            conformance::emit(conformance::Event::ResponseComplete);
             return Err(ClientError::Operation(OperationError {
                 code: "redirect_not_allowed".into(),
                 status,
@@ -369,6 +394,8 @@ impl Client {
                 "operation response is too large".into(),
             ));
         }
+        #[cfg(feature = "conformance")]
+        conformance::emit(conformance::Event::ResponseComplete);
         let value: Value = serde_json::from_slice(&data).map_err(|_| {
             ClientError::Operation(OperationError {
                 code: "invalid_response".into(),
