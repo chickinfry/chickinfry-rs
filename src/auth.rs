@@ -1,5 +1,5 @@
 use crate::database::{DatabasePort, TransactionPort};
-use crate::orm::{Filter, FindMany};
+use crate::orm::{Direction, Filter, FindMany, Order};
 use crate::private_auth::*;
 use crate::server::{OperationError, Session, SessionUser};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -9,6 +9,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{future::Future, pin::Pin};
 use subtle::ConstantTimeEq;
+
+// 옛 refresh 계열의 고정 저장 수명이 지나면 세션 만료 값과 무관하게 후보가 됩니다.
+const LEGACY_REFRESH_LIFETIME_MILLIS: i64 = 604_800_000;
 
 #[derive(Clone)]
 pub struct AuthUser {
@@ -136,6 +139,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                 error
             }
         })?;
+        self.cleanup().await;
         self.committed(&user).await?;
         Ok(tokens)
     }
@@ -162,9 +166,12 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
             .first()
             .filter(|user| matched && user.disabled_at.is_none())
             .ok_or_else(|| OperationError::new("invalid_credentials", 401))?;
-        self.db
+        let tokens = self
+            .db
             .transaction(async |tx| self.issue(tx, user).await)
-            .await
+            .await?;
+        self.cleanup().await;
+        Ok(tokens)
     }
 
     pub async fn signin_identity(
@@ -255,6 +262,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                     error
                 }
             })?;
+        self.cleanup().await;
         if let Some(user) = result.1 {
             self.committed(&user).await?;
         }
@@ -541,7 +549,9 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                 }))
             })
             .await?;
-        outcome.ok_or_else(|| OperationError::new("session_revoked", 401))
+        let tokens = outcome.ok_or_else(|| OperationError::new("session_revoked", 401))?;
+        self.cleanup().await;
+        Ok(tokens)
     }
 
     async fn issue(
@@ -587,6 +597,187 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
             user_id: user.id.clone(),
             session_id: session.id,
         })
+    }
+
+    async fn cleanup(&self) {
+        // Cleanup runs after issuance commits so maintenance cannot undo issued credentials.
+        let _ = self
+            .db
+            .transaction(async |tx| {
+                let mut remaining = 96;
+                let now = now_millis();
+                let candidates = tx
+                    .app_auth_sessions
+                    .find_many(FindMany {
+                        filter: Some(self.cleanup_candidates(tx, now)?),
+                        limit: Some(remaining),
+                        ..Default::default()
+                    })
+                    .await?;
+                for candidate in candidates {
+                    let session = tx
+                        .app_auth_sessions
+                        .update_if(
+                            AppAuthSessionsPrimaryKey { id: candidate.id },
+                            self.cleanup_candidates(tx, now)?,
+                            AppAuthSessionsUpdate {
+                                created_at: Some(candidate.created_at),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    let Some(session) = session else { continue };
+                    if session.revoked_at.is_none() {
+                        let latest = if session.first_login_at.is_none() {
+                            tx.app_auth_refresh_tokens
+                                .find_many(FindMany {
+                                    filter: Some(Filter::all(vec![
+                                        Filter::eq(
+                                            tx.app_auth_refresh_tokens.columns().session_id,
+                                            json!(session.id),
+                                        ),
+                                        Filter::is_null(
+                                            tx.app_auth_refresh_tokens.columns().consumed_at,
+                                        ),
+                                    ])),
+                                    order: vec![Order {
+                                        column: tx.app_auth_refresh_tokens.columns().created_at,
+                                        direction: Direction::Descending,
+                                    }],
+                                    limit: Some(1),
+                                    ..Default::default()
+                                })
+                                .await?
+                                .into_iter()
+                                .next()
+                        } else {
+                            None
+                        };
+                        if !self.session_policy.expired(
+                            now,
+                            session.first_login_at.as_deref(),
+                            &session.created_at,
+                            session.last_renewed_at.as_deref(),
+                            latest.as_ref().map(|row| row.created_at.as_str()),
+                            latest.as_ref().map(|row| row.expires_at.as_str()),
+                        )? {
+                            continue;
+                        }
+                        tx.app_auth_sessions
+                            .update(
+                                AppAuthSessionsPrimaryKey {
+                                    id: session.id.clone(),
+                                },
+                                AppAuthSessionsUpdate {
+                                    revoked_at: Some(Some(timestamp_at(now)?)),
+                                    ..Default::default()
+                                },
+                            )
+                            .await?;
+                    }
+                    let refreshes = tx
+                        .app_auth_refresh_tokens
+                        .find_many(FindMany {
+                            filter: Some(Filter::eq(
+                                tx.app_auth_refresh_tokens.columns().session_id,
+                                json!(session.id),
+                            )),
+                            limit: Some(remaining),
+                            ..Default::default()
+                        })
+                        .await?;
+                    for refresh in refreshes {
+                        tx.app_auth_refresh_tokens
+                            .delete(AppAuthRefreshTokensPrimaryKey { id: refresh.id })
+                            .await?;
+                        remaining -= 1;
+                    }
+                    if remaining == 0 {
+                        break;
+                    }
+                    tx.app_auth_sessions
+                        .delete(AppAuthSessionsPrimaryKey { id: session.id })
+                        .await?;
+                    remaining -= 1;
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+                if remaining > 0 {
+                    let columns = tx.app_auth_rate_limits.columns();
+                    let elapsed = Filter::le(columns.expires_at, json!(timestamp_at(now)?));
+                    let limits = tx
+                        .app_auth_rate_limits
+                        .find_many(FindMany {
+                            filter: Some(elapsed.clone()),
+                            limit: Some(remaining),
+                            ..Default::default()
+                        })
+                        .await?;
+                    for limit in limits {
+                        let key = AppAuthRateLimitsPrimaryKey {
+                            action: limit.action,
+                            key_hash: limit.key_hash,
+                        };
+                        if tx
+                            .app_auth_rate_limits
+                            .update_if(
+                                AppAuthRateLimitsPrimaryKey {
+                                    action: key.action.clone(),
+                                    key_hash: key.key_hash.clone(),
+                                },
+                                elapsed.clone(),
+                                AppAuthRateLimitsUpdate {
+                                    expires_at: Some(limit.expires_at),
+                                    ..Default::default()
+                                },
+                            )
+                            .await?
+                            .is_some()
+                        {
+                            tx.app_auth_rate_limits.delete(key).await?;
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .await;
+    }
+
+    fn cleanup_candidates(
+        &self,
+        tx: &TransactionDatabase,
+        now: i64,
+    ) -> Result<Filter, OperationError> {
+        let columns = tx.app_auth_sessions.columns();
+        let cutoff = json!(timestamp_at(now - self.session_policy.idle_millis)?);
+        let mut filters = vec![
+            Filter::is_not_null(columns.revoked_at),
+            Filter::le(columns.last_renewed_at, cutoff.clone()),
+            Filter::all(vec![
+                Filter::is_null(columns.last_renewed_at),
+                Filter::le(columns.expires_at, cutoff),
+            ]),
+            Filter::all(vec![
+                Filter::is_null(columns.last_renewed_at),
+                Filter::le(
+                    columns.created_at,
+                    json!(timestamp_at(now - LEGACY_REFRESH_LIFETIME_MILLIS)?),
+                ),
+            ]),
+        ];
+        if self.session_policy.absolute_millis != 0 {
+            let cutoff = json!(timestamp_at(now - self.session_policy.absolute_millis)?);
+            filters.push(Filter::le(columns.first_login_at, cutoff.clone()));
+            filters.push(Filter::all(vec![
+                Filter::is_null(columns.first_login_at),
+                Filter::le(columns.created_at, cutoff),
+            ]));
+        }
+        Ok(Filter::all(vec![
+            Filter::eq(columns.transport, json!("native")),
+            Filter::any(filters),
+        ]))
     }
 
     async fn rate_limit(
@@ -957,8 +1148,515 @@ mod tests {
                 calls
                     .iter()
                     .all(|call| assignment(call, "first_login_at").is_none()
-                        && assignment(call, "last_renewed_at").is_none())
+                        && assignment(call, "last_renewed_at").is_none()
+                        && assignment(call, "expires_at").is_none())
             );
+        }
+
+        #[derive(Default)]
+        struct CleanupHost {
+            tables: std::collections::BTreeMap<String, Vec<Value>>,
+            calls: Vec<Value>,
+            deleted: usize,
+        }
+
+        fn matches_filter(expression: &str, params: &[Value], row: &Value) -> bool {
+            fn evaluate(tokens: &[&str], params: &[Value], row: &Value) -> bool {
+                let mut depth = 0;
+                for (index, token) in tokens.iter().enumerate() {
+                    match *token {
+                        "(" => depth += 1,
+                        ")" => depth -= 1,
+                        _ => {}
+                    }
+                    if depth == 0 && (*token == "or" || *token == "and") {
+                        let left = evaluate(&tokens[..index], params, row);
+                        let right = evaluate(&tokens[index + 1..], params, row);
+                        return if *token == "or" {
+                            left || right
+                        } else {
+                            left && right
+                        };
+                    }
+                }
+                if tokens[0] == "not" {
+                    return !evaluate(&tokens[1..], params, row);
+                }
+                if tokens[0] == "(" {
+                    return evaluate(&tokens[1..tokens.len() - 1], params, row);
+                }
+                let value = &row[tokens[0].trim_matches('"')];
+                if tokens[1] == "is" {
+                    return value.is_null() == (tokens[2] == "null");
+                }
+                let bound =
+                    &params[tokens[2].trim_start_matches('$').parse::<usize>().unwrap() - 1];
+                if value.is_null() || bound.is_null() {
+                    return false;
+                }
+                let ordering = match (value.as_str(), bound.as_str()) {
+                    (Some(left), Some(right)) => {
+                        match (parse_timestamp(left), parse_timestamp(right)) {
+                            (Ok(left), Ok(right)) => left.cmp(&right),
+                            _ => left.cmp(right),
+                        }
+                    }
+                    _ => value.as_i64().unwrap().cmp(&bound.as_i64().unwrap()),
+                };
+                match tokens[1] {
+                    "=" => ordering.is_eq(),
+                    "<=" => !ordering.is_gt(),
+                    "<" => ordering.is_lt(),
+                    ">" => ordering.is_gt(),
+                    ">=" => !ordering.is_lt(),
+                    _ => panic!("unsupported predicate"),
+                }
+            }
+            let spaced = expression.replace('(', " ( ").replace(')', " ) ");
+            evaluate(&spaced.split_whitespace().collect::<Vec<_>>(), params, row)
+        }
+
+        impl CleanupHost {
+            fn add(&mut self, table: &str, row: Value) {
+                self.tables.entry(table.into()).or_default().push(row);
+            }
+
+            fn respond(&mut self, request: Value) -> Value {
+                self.calls.push(request.clone());
+                let op = request["op"].as_str().unwrap();
+                if op == "begin" {
+                    return json!({"lease": 7});
+                }
+                if op == "commit" || op == "rollback" {
+                    return json!({});
+                }
+                let sql = request["sql"].as_str().unwrap();
+                let params = request["params"].as_array().unwrap();
+                let table = sql
+                    .split('"')
+                    .find(|word| word.starts_with("app_auth_"))
+                    .unwrap();
+                let rows = self.tables.entry(table.into()).or_default();
+                let filter = sql.split_once(" where ").map(|(_, tail)| {
+                    tail.split(" order by ")
+                        .next()
+                        .unwrap()
+                        .split(" limit ")
+                        .next()
+                        .unwrap()
+                        .split(" returning ")
+                        .next()
+                        .unwrap()
+                });
+                let mut selected: Vec<_> = rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, row)| {
+                        filter.is_none_or(|filter| matches_filter(filter, params, row))
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+                if let Some((_, order)) = sql.split_once(" order by ") {
+                    let column = order.split('"').nth(1).unwrap();
+                    selected.sort_by_key(|index| rows[*index][column].as_str().unwrap().to_owned());
+                    if order.contains(" desc") {
+                        selected.reverse();
+                    }
+                }
+                if let Some((_, limit)) = sql.split_once(" limit ") {
+                    let limit = limit.split_whitespace().next().unwrap();
+                    let count = if let Some(index) = limit.strip_prefix('$') {
+                        params[index.parse::<usize>().unwrap() - 1]
+                            .as_u64()
+                            .unwrap() as usize
+                    } else {
+                        limit.parse().unwrap()
+                    };
+                    selected.truncate(count);
+                }
+                if sql.starts_with("update ") {
+                    let set = sql
+                        .split_once(" set ")
+                        .unwrap()
+                        .1
+                        .split_once(" where ")
+                        .unwrap()
+                        .0;
+                    for &index in &selected {
+                        for term in set.split(", ") {
+                            let (column, parameter) = term.split_once(" = $").unwrap();
+                            rows[index][column.trim_matches('"')] =
+                                params[parameter.parse::<usize>().unwrap() - 1].clone();
+                        }
+                    }
+                }
+                let result: Vec<_> = selected.iter().map(|index| rows[*index].clone()).collect();
+                if sql.starts_with("delete ") {
+                    self.deleted += selected.len();
+                    selected.sort_unstable();
+                    for index in selected.into_iter().rev() {
+                        rows.remove(index);
+                    }
+                }
+                json!({"rows": result})
+            }
+        }
+
+        fn fixture_id(index: usize) -> String {
+            format!("00000000-0000-4000-8000-{index:012}")
+        }
+
+        #[test]
+        fn f05_cleanup_budget_and_progress_preserve_reuse_revocation() {
+            let auth = checked(Auth::new(DatabasePort::new(1), &[], &NoHooks));
+            let mut host = CleanupHost::default();
+            let mut live = session();
+            live["token_hash"] = json!(token_digest(&"B".repeat(43)));
+            live["first_login_at"] = json!(checked(timestamp_at(0)));
+            live["created_at"] = live["first_login_at"].clone();
+            host.add("app_auth_sessions", live.clone());
+            for index in 0..100 {
+                let mut old = refresh();
+                old["id"] = json!(fixture_id(index + 100));
+                old["token_hash"] = json!(token_digest(&if index == 0 {
+                    "A".repeat(43)
+                } else {
+                    format!("old-{index}")
+                }));
+                old["created_at"] = json!(checked(timestamp_at(0)));
+                old["expires_at"] = json!(checked(timestamp_at(30 * DAY)));
+                old["consumed_at"] = json!(checked(timestamp_at(29 * DAY)));
+                host.add("app_auth_refresh_tokens", old);
+            }
+            let mut latest = refresh();
+            latest["id"] = json!(fixture_id(450));
+            latest["token_hash"] = json!(token_digest(&"C".repeat(43)));
+            host.add("app_auth_refresh_tokens", latest);
+            let mut dead = session();
+            dead["id"] = json!(fixture_id(500));
+            dead["created_at"] = json!(checked(timestamp_at(testing::NOW - 8 * DAY)));
+            dead["first_login_at"] = Value::Null;
+            dead["last_renewed_at"] = Value::Null;
+            host.add("app_auth_sessions", dead.clone());
+            for index in 0..110 {
+                let mut old = refresh();
+                old["id"] = json!(fixture_id(index + 600));
+                old["session_id"] = dead["id"].clone();
+                old["token_hash"] = json!(token_digest(&format!("dead-{index}")));
+                old["created_at"] = dead["created_at"].clone();
+                old["expires_at"] = json!(checked(timestamp_at(testing::NOW - DAY)));
+                host.add("app_auth_refresh_tokens", old);
+            }
+            for index in 0..110 {
+                host.add("app_auth_rate_limits", json!({"action": "signin", "key_hash": format!("{index:064x}"), "attempt_count": 10, "expires_at": checked(timestamp_at(testing::NOW))}));
+            }
+            host.add("app_auth_users", user());
+            let state = Rc::new(RefCell::new(host));
+            for pass in 0..4 {
+                let state_host = state.clone();
+                let before = state.borrow().deleted;
+                testing::run(
+                    move |request| state_host.borrow_mut().respond(request),
+                    auth.cleanup(),
+                );
+                let after = state.borrow().deleted;
+                assert!(after - before <= 96, "cleanup exceeded deletion budget");
+                if pass == 0 {
+                    assert_eq!(
+                        after - before,
+                        96,
+                        "cleanup made no progress past retained credentials"
+                    );
+                }
+            }
+            {
+                let host = state.borrow();
+                assert_eq!(
+                    host.tables["app_auth_sessions"].len(),
+                    1,
+                    "dead family was not removed"
+                );
+                assert!(host.tables["app_auth_rate_limits"].is_empty());
+                assert_eq!(
+                    host.tables["app_auth_sessions"][0]["revoked_at"],
+                    Value::Null
+                );
+            }
+            let state_host = state.clone();
+            let error = testing::run(
+                move |request| state_host.borrow_mut().respond(request),
+                auth.refresh(&"A".repeat(43)),
+            )
+            .err()
+            .expect("reuse accepted");
+            assert_eq!(
+                error.code, "session_revoked",
+                "cleanup hid retained reuse credential"
+            );
+            let state_host = state.clone();
+            let error = testing::run(
+                move |request| state_host.borrow_mut().respond(request),
+                auth.session(&"B".repeat(43)),
+            )
+            .err()
+            .expect("revoked access accepted");
+            assert_eq!(error.code, "invalid_token");
+            let state_host = state.clone();
+            let error = testing::run(
+                move |request| state_host.borrow_mut().respond(request),
+                auth.refresh(&"C".repeat(43)),
+            )
+            .err()
+            .expect("revoked latest refresh accepted");
+            assert_eq!(error.code, "session_revoked");
+            let host = state.borrow();
+            assert!(!host.tables["app_auth_sessions"][0]["revoked_at"].is_null());
+            assert_eq!(
+                host.tables["app_auth_sessions"][0]["last_renewed_at"],
+                live["last_renewed_at"]
+            );
+            assert!(host.calls.last().unwrap()["op"] == "commit");
+            assert!(
+                host.calls
+                    .iter()
+                    .filter(|call| call["sql"]
+                        .as_str()
+                        .is_some_and(|sql| sql.starts_with("update \"app_auth_sessions\"")))
+                    .all(|call| assignment(call, "expires_at").is_none()),
+                "cleanup or revocation changed session expiry"
+            );
+        }
+
+        #[test]
+        fn f05_legacy_selection_delays_without_starving_dead_families() {
+            let auth = checked(
+                checked(Auth::new(DatabasePort::new(1), &[], &NoHooks))
+                    .with_session_policy(3_600, 0),
+            );
+            let mut host = CleanupHost::default();
+            for index in 0..101 {
+                let mut legacy = session();
+                legacy["id"] = json!(fixture_id(index + 100));
+                legacy["first_login_at"] = Value::Null;
+                legacy["last_renewed_at"] = Value::Null;
+                let age = if index < 100 {
+                    30 * 60_000
+                } else {
+                    2 * 3_600_000
+                };
+                legacy["created_at"] = json!(checked(timestamp_at(testing::NOW - age)));
+                legacy["expires_at"] = json!(checked(timestamp_at(testing::NOW - age + 900_000)));
+                host.add("app_auth_sessions", legacy.clone());
+                let mut credential = refresh();
+                credential["id"] = json!(fixture_id(index + 300));
+                credential["session_id"] = legacy["id"].clone();
+                credential["token_hash"] = json!(token_digest(&format!("legacy-{index}")));
+                credential["created_at"] = json!(checked(timestamp_at(testing::NOW - age)));
+                credential["expires_at"] =
+                    json!(checked(timestamp_at(testing::NOW - age + 7 * DAY)));
+                host.add("app_auth_refresh_tokens", credential);
+            }
+            let state = Rc::new(RefCell::new(host));
+            let state_host = state.clone();
+            testing::run(
+                move |request| state_host.borrow_mut().respond(request),
+                auth.cleanup(),
+            );
+            let host = state.borrow();
+            assert_eq!(host.deleted, 2, "legacy dead family did not progress");
+            assert_eq!(host.tables["app_auth_sessions"].len(), 100);
+            assert_eq!(host.tables["app_auth_refresh_tokens"].len(), 100);
+            assert_eq!(
+                host.calls
+                    .iter()
+                    .filter(|call| call["sql"]
+                        .as_str()
+                        .is_some_and(|sql| sql.starts_with("update \"app_auth_sessions\"")))
+                    .count(),
+                2,
+                "live legacy families consumed candidates"
+            );
+        }
+
+        #[test]
+        fn f05_legacy_seven_day_boundary_ignores_invalid_access_expiry() {
+            let auth = checked(Auth::new(DatabasePort::new(1), &[], &NoHooks));
+            for age in [7 * DAY - 1, 7 * DAY, 7 * DAY + 1] {
+                let mut host = CleanupHost::default();
+                let mut legacy = session();
+                legacy["created_at"] = json!(checked(timestamp_at(testing::NOW - age)));
+                legacy["first_login_at"] = Value::Null;
+                legacy["last_renewed_at"] = Value::Null;
+                host.add("app_auth_sessions", legacy.clone());
+                let mut credential = refresh();
+                credential["created_at"] = legacy["created_at"].clone();
+                credential["expires_at"] =
+                    json!(checked(timestamp_at(testing::NOW - age + 7 * DAY)));
+                host.add("app_auth_refresh_tokens", credential);
+                let state = Rc::new(RefCell::new(host));
+                let state_host = state.clone();
+                testing::run(
+                    move |request| state_host.borrow_mut().respond(request),
+                    auth.cleanup(),
+                );
+                let host = state.borrow();
+                let dead = age >= 7 * DAY;
+                assert_eq!(host.deleted, if dead { 2 } else { 0 });
+                assert_eq!(host.tables["app_auth_sessions"].is_empty(), dead);
+                if !dead {
+                    assert!(
+                        host.calls.iter().all(|call| !call["sql"]
+                            .as_str()
+                            .is_some_and(|sql| sql.starts_with("update "))),
+                        "younger legacy family consumed a cleanup candidate"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn f05_lock_recheck_preserves_concurrent_renewals() {
+            let auth = checked(Auth::new(DatabasePort::new(1), &[], &NoHooks));
+            let mut host = CleanupHost::default();
+            let mut candidate = session();
+            candidate["last_renewed_at"] = json!(checked(timestamp_at(testing::NOW - 30 * DAY)));
+            host.add("app_auth_sessions", candidate);
+            host.add("app_auth_rate_limits", json!({"action": "signin", "key_hash": "a".repeat(64), "attempt_count": 10, "expires_at": checked(timestamp_at(testing::NOW))}));
+            let state = Rc::new(RefCell::new(host));
+            let state_host = state.clone();
+            testing::run(
+                move |request| {
+                    let mut host = state_host.borrow_mut();
+                    let sql = request["sql"].as_str().unwrap_or("");
+                    if sql.starts_with("update \"app_auth_sessions\"") {
+                        host.tables.get_mut("app_auth_sessions").unwrap()[0]["last_renewed_at"] =
+                            json!(checked(timestamp_at(testing::NOW)));
+                    }
+                    if sql.starts_with("update \"app_auth_rate_limits\"") {
+                        let row = &mut host.tables.get_mut("app_auth_rate_limits").unwrap()[0];
+                        row["expires_at"] = json!(checked(timestamp_at(testing::NOW + DAY)));
+                        row["attempt_count"] = json!(1);
+                    }
+                    host.respond(request)
+                },
+                auth.cleanup(),
+            );
+            let host = state.borrow();
+            assert_eq!(host.deleted, 0, "cleanup deleted renewed state");
+            assert!(host.tables["app_auth_sessions"][0]["revoked_at"].is_null());
+            assert_eq!(host.tables["app_auth_rate_limits"][0]["attempt_count"], 1);
+        }
+
+        #[test]
+        fn f05_current_absolute_cap_uses_first_login_or_family_creation() {
+            for legacy in [false, true] {
+                let auth = checked(
+                    checked(Auth::new(DatabasePort::new(1), &[], &NoHooks))
+                        .with_session_policy(3_600, 3_600),
+                );
+                let mut host = CleanupHost::default();
+                let mut candidate = session();
+                candidate["first_login_at"] = if legacy {
+                    Value::Null
+                } else {
+                    json!(checked(timestamp_at(testing::NOW - 3_600_000)))
+                };
+                candidate["last_renewed_at"] = if legacy {
+                    Value::Null
+                } else {
+                    json!(checked(timestamp_at(testing::NOW - 60_000)))
+                };
+                host.add("app_auth_sessions", candidate);
+                host.add("app_auth_refresh_tokens", refresh());
+                let state = Rc::new(RefCell::new(host));
+                let state_host = state.clone();
+                testing::run(
+                    move |request| state_host.borrow_mut().respond(request),
+                    auth.cleanup(),
+                );
+                let host = state.borrow();
+                assert_eq!(host.deleted, 2, "cleanup diverged from current policy");
+            }
+        }
+
+        #[test]
+        fn f05_cleanup_failure_keeps_committed_refresh_success() {
+            let auth = checked(Auth::new(DatabasePort::new(1), &[], &NoHooks));
+            let (result, calls) = run(
+                vec![
+                    ("query", rows(refresh())),
+                    ("begin", json!({"lease": 7})),
+                    ("exec", rows(session())),
+                    ("exec", rows(refresh())),
+                    ("exec", rows(user())),
+                    ("exec", rows(refresh())),
+                    ("exec", rows(session())),
+                    ("exec", rows(refresh())),
+                    ("commit", json!({})),
+                    ("begin", json!({"lease": 7})),
+                    ("exec", json!({"error": "cleanup_private_failure_marker"})),
+                    ("rollback", json!({})),
+                ],
+                auth.refresh(&"A".repeat(43)),
+            );
+            let tokens = checked(result);
+            assert_eq!(tokens.session_id, SESSION_ID);
+            assert!(
+                !serde_json::to_string(&tokens)
+                    .unwrap()
+                    .contains("cleanup_private_failure_marker")
+            );
+            assert!(calls[8]["op"] == "commit" && calls.last().unwrap()["op"] == "rollback");
+        }
+
+        #[test]
+        fn session_expiry_invariant_signin_commits_with_refresh() {
+            let auth = checked(Auth::new(DatabasePort::new(1), &[], &NoHooks));
+            let password = "test password for sign-in";
+            let mut user = user();
+            user["password_hash"] = json!(checked(hash_password(password)));
+            let (result, calls) = run(
+                vec![
+                    ("query", json!({"rows": []})),
+                    (
+                        "query",
+                        rows(
+                            json!({"action": "signin", "key_hash": "a".repeat(64), "attempt_count": 1, "expires_at": checked(timestamp_at(testing::NOW + DAY))}),
+                        ),
+                    ),
+                    ("query", rows(user)),
+                    ("begin", json!({"lease": 7})),
+                    ("exec", rows(session())),
+                    ("exec", rows(refresh())),
+                    ("commit", json!({})),
+                    ("begin", json!({"lease": 7})),
+                    ("exec", json!({"rows": []})),
+                    ("exec", json!({"rows": []})),
+                    ("commit", json!({})),
+                ],
+                auth.signin("user@example.test", password),
+            );
+            checked(result);
+            let sql = calls[4]["sql"].as_str().unwrap();
+            assert!(sql.starts_with("insert into \"app_auth_sessions\""));
+            let columns = sql.split_once('(').unwrap().1.split_once(')').unwrap().0;
+            let expiry_index = columns
+                .split(", ")
+                .position(|column| column == "\"expires_at\"")
+                .expect("sign-in omitted session expiry");
+            assert!(
+                checked(parse_timestamp(
+                    calls[4]["params"][expiry_index].as_str().unwrap()
+                )) >= testing::NOW,
+                "sign-in wrote session expiry before issuance"
+            );
+            assert!(
+                calls[5]["sql"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("insert into \"app_auth_refresh_tokens\"")
+            );
+            assert!(calls[6]["op"] == "commit");
         }
 
         #[test]
@@ -982,6 +1680,10 @@ mod tests {
                         ("exec", rows(refresh())),
                         ("exec", rows(session)),
                         ("exec", rows(refresh())),
+                        ("commit", json!({})),
+                        ("begin", json!({"lease": 7})),
+                        ("exec", json!({"rows": []})),
+                        ("exec", json!({"rows": []})),
                         ("commit", json!({})),
                     ],
                     auth.refresh(&"A".repeat(43)),
@@ -1007,11 +1709,20 @@ mod tests {
                         == Some(&json!(checked(timestamp_at(testing::NOW))))
                 );
                 assert!(
+                    checked(parse_timestamp(
+                        assignment(&calls[6], "expires_at")
+                            .and_then(Value::as_str)
+                            .expect("rotation omitted session expiry")
+                    )) >= testing::NOW,
+                    "rotation wrote session expiry before issuance"
+                );
+                assert!(
                     calls[7]["sql"]
                         .as_str()
                         .unwrap()
                         .starts_with("insert into \"app_auth_refresh_tokens\"")
                 );
+                assert!(calls[8]["op"] == "commit");
                 assert!(calls.last().unwrap()["op"] == "commit");
             }
         }
@@ -1098,9 +1809,36 @@ mod tests {
             assert!(
                 calls
                     .iter()
-                    .all(|call| assignment(call, "first_login_at").is_none())
+                    .all(|call| assignment(call, "first_login_at").is_none()
+                        && assignment(call, "expires_at").is_none())
             );
             assert!(calls.last().unwrap()["op"] == "commit");
+        }
+
+        #[test]
+        fn session_expiry_invariant_logout_only_revokes() {
+            let auth = checked(Auth::new(DatabasePort::new(1), &[], &NoHooks));
+            let (result, calls) = run(
+                vec![
+                    ("query", rows(session())),
+                    ("begin", json!({"lease": 7})),
+                    ("exec", rows(session())),
+                    ("exec", rows(user())),
+                    ("commit", json!({})),
+                    ("query", rows(session())),
+                ],
+                auth.logout(&"A".repeat(43)),
+            );
+            checked(result);
+            assert!(
+                calls
+                    .iter()
+                    .all(|call| assignment(call, "expires_at").is_none())
+            );
+            assert!(
+                assignment(calls.last().unwrap(), "revoked_at")
+                    == Some(&json!(checked(timestamp_at(testing::NOW))))
+            );
         }
     }
 
