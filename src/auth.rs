@@ -859,21 +859,37 @@ fn public_user(row: &AppAuthUsersRow) -> AuthUser {
 }
 
 fn normalize_email(value: &str) -> Result<String, OperationError> {
-    let email = value
-        .trim_matches(|ch: char| ch.is_whitespace() || ch == '\u{feff}')
-        .to_lowercase();
+    // ECMAScript WhiteSpace and LineTerminator exclude NEL (U+0085).
+    let is_whitespace = |ch| {
+        matches!(
+            ch,
+            '\u{0009}'..='\u{000d}'
+                | '\u{0020}'
+                | '\u{00a0}'
+                | '\u{1680}'
+                | '\u{2000}'..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\u{feff}'
+        )
+    };
+    let email = value.trim_matches(is_whitespace).to_lowercase();
+    if email.contains('\0') {
+        return Err(OperationError::new("invalid_input", 400));
+    }
     let parts: Vec<_> = email.split('@').collect();
     let valid_domain = parts
         .get(1)
         .and_then(|domain| domain.rsplit_once('.'))
         .is_some_and(|(head, tail)| !head.is_empty() && !tail.is_empty());
-    if email.encode_utf16().count() > 320
-        || parts.len() != 2
+    if parts.len() != 2
         || parts[0].is_empty()
         || !valid_domain
-        || email
-            .chars()
-            .any(|ch| ch.is_whitespace() || ch == '\u{feff}' || ch == '\0')
+        || email.chars().any(is_whitespace)
+        || email.encode_utf16().count() > 320
     {
         return Err(OperationError::new("invalid_input", 400));
     }
@@ -1037,6 +1053,52 @@ mod tests {
     use super::*;
 
     const DAY: i64 = 86_400_000;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn shared_email_normalization_corpus() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            input: String,
+            normalized: Option<String>,
+            error: Option<String>,
+        }
+
+        let corpus = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/emails.json"
+        ))
+        .expect("shared email corpus must be readable");
+        let cases: Vec<Case> =
+            serde_json::from_str(&corpus).expect("shared email corpus must be valid JSON");
+        assert!(
+            !cases.is_empty(),
+            "0 cases, 1 failures: shared email corpus must not be empty"
+        );
+
+        let mut failures = Vec::new();
+        let count = cases.len();
+        for case in cases {
+            let expected = match (case.normalized, case.error) {
+                (Some(normalized), None) => Ok(normalized),
+                (None, Some(error)) => {
+                    assert_eq!(error, "invalid_input", "{}: unknown error", case.name);
+                    Err(error)
+                }
+                _ => panic!("{}: expected exactly one outcome", case.name),
+            };
+            if normalize_email(&case.input).map_err(|error| error.code) != expected {
+                failures.push(case.name);
+            }
+        }
+        println!("{count} cases, {} failures", failures.len());
+        assert!(
+            failures.is_empty(),
+            "failing cases: {}",
+            failures.join(", ")
+        );
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     mod rolling {
