@@ -699,9 +699,10 @@ fn sdk_error(error: ClientError) -> Error {
             "invalid access token",
             "invalid operation name",
             "invalid operation request",
-            "operation request is too large",
-            "could not read operation response",
-            "operation response is too large",
+            "The request is too large. Reduce the submitted data and try again.",
+            "Could not complete the request. Check your connection and confirm the operation outcome before trying again.",
+            "Could not read the response. Confirm the operation outcome before trying again.",
+            "The response is too large. The operation may have completed; confirm its outcome before requesting less data.",
             "session store is bound to a different origin",
             "invalid session credential",
             "invalid operation response field",
@@ -1005,9 +1006,60 @@ pub fn run<R: BufRead, W: Write + Send + 'static>(
     Ok(())
 }
 
-#[cfg(all(test, not(feature = "conformance"), feature = "sdk"))]
+#[cfg(all(test, feature = "sdk"))]
 #[path = "../../tests/common/mod.rs"]
 mod common;
+#[cfg(all(test, feature = "sdk"))]
+#[path = "../../tests/common/error.rs"]
+mod error;
+
+#[cfg(all(test, feature = "sdk"))]
+#[test]
+fn transport_error_allowlist_matches_runtime_messages() {
+    let responses = [
+        "INVALID synthetic-transport-marker\r\n\r\n".into(),
+        common::response("HTTP/1.1 200 OK", "short")
+            .replace("content-length: 5", "content-length: 100"),
+        common::response("HTTP/1.1 200 OK", &"x".repeat((1 << 20) + 1)),
+    ];
+    for (reply, expected) in responses.into_iter().zip([
+        "Could not complete the request. Check your connection and confirm the operation outcome before trying again.",
+        "Could not read the response. Confirm the operation outcome before trying again.",
+        "The response is too large. The operation may have completed; confirm its outcome before requesting less data.",
+    ]) {
+        let (origin, requests) = common::serve(&[reply]);
+        let client = Client::new(&origin).unwrap();
+        let error = client.invoke("probe.echo", &json!({})).unwrap_err();
+        error::assert_safe_protocol(&error, expected);
+        assert_eq!(sdk_error(error).raw_transport_details, Some(false));
+        let request = requests.recv().unwrap();
+        assert_eq!(request.path, "/probe.echo");
+        assert!(request.authorization.is_none());
+        assert_eq!(request.body, "{}");
+    }
+    let client = Client::new("https://example.com").unwrap();
+    let error = client
+        .invoke("probe.echo", &json!({"value":"x".repeat(4 << 20)}))
+        .unwrap_err();
+    error::assert_safe_protocol(
+        &error,
+        "The request is too large. Reduce the submitted data and try again.",
+    );
+    assert_eq!(sdk_error(error).raw_transport_details, Some(false));
+    assert_eq!(
+        sdk_error(ClientError::Protocol("synthetic-unlisted-marker".into())).raw_transport_details,
+        Some(true)
+    );
+    // A safe message followed by extra text must not pass as safe; only exact matches are allowed.
+    assert_eq!(
+        sdk_error(ClientError::Protocol(
+            "Could not read the response. Confirm the operation outcome before trying again. synthetic-suffix-marker"
+                .into()
+        ))
+        .raw_transport_details,
+        Some(true)
+    );
+}
 
 #[cfg(all(test, not(feature = "conformance"), feature = "sdk"))]
 #[test]

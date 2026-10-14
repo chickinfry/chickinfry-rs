@@ -40,6 +40,11 @@ The generated client exposes the same call as a typed method for every
 declared operation, so you pass a typed input struct and get a typed output
 struct back.
 
+Transport failures use fixed messages in `Display`, `Debug`, and the public
+protocol message, without underlying exception details, response bodies, or
+headers. Check your connection and confirm the operation outcome before trying
+again; the SDK does not automatically retry transport failures.
+
 `client::MemorySessionStore` keeps an optional session record for one origin in
 memory. Its `clear(expected)` compares and deletes under the same lock, so a
 late rejection cannot remove a newer login. Custom `client::SessionStore`

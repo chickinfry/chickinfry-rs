@@ -701,7 +701,7 @@ fn diagnostic_sdk_errors_preserve_codes_status_and_transport_uncertainty() {
         let response = driver.next();
         assert_eq!(
             response["error"],
-            json!({"kind":"sdk","code":code,"httpStatus":status,"outcomeUnknown":unknown,"rawTransportDetails":matches!(id, "disconnected" | "refused")})
+            json!({"kind":"sdk","code":code,"httpStatus":status,"outcomeUnknown":unknown,"rawTransportDetails":false})
         );
         assert!(response["result"].is_null());
     }

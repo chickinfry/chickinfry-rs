@@ -43,7 +43,11 @@ impl fmt::Display for OperationError {
             formatter,
             "operation failed ({}, HTTP {})",
             self.code, self.status
-        )
+        )?;
+        if self.code == "invalid_response" {
+            write!(formatter, ". Contact the application maintainer.")?;
+        }
+        Ok(())
     }
 }
 
@@ -449,7 +453,7 @@ impl Client {
             .map_err(|_| ClientError::Protocol("invalid operation request".into()))?;
         if body.len() > MAX_REQUEST_BYTES {
             return Err(ClientError::Protocol(
-                "operation request is too large".into(),
+                "The request is too large. Reduce the submitted data and try again.".into(),
             ));
         }
         let mut request = self
@@ -465,7 +469,11 @@ impl Client {
         });
         let response = request
             .send(body)
-            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+            .map_err(|_| {
+                ClientError::Protocol(
+                    "Could not complete the request. Check your connection and confirm the operation outcome before trying again.".into(),
+                )
+            })?;
         let status = response.status().as_u16();
         #[cfg(feature = "conformance")]
         conformance::emit(conformance::Event::Response { status });
@@ -522,10 +530,15 @@ impl Client {
             bytes: 0,
             retained: Some(data.capacity()),
         });
-        result.map_err(|_| ClientError::Protocol("could not read operation response".into()))?;
+        result.map_err(|_| {
+            ClientError::Protocol(
+                "Could not read the response. Confirm the operation outcome before trying again."
+                    .into(),
+            )
+        })?;
         if data.len() > MAX_RESPONSE_BYTES {
             return Err(ClientError::Protocol(
-                "operation response is too large".into(),
+                "The response is too large. The operation may have completed; confirm its outcome before requesting less data.".into(),
             ));
         }
         #[cfg(feature = "conformance")]

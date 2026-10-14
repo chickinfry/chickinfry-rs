@@ -5,9 +5,12 @@
 mod client;
 
 mod common;
+#[path = "common/error.rs"]
+mod error;
 
 use client::{Client, ClientError, OperationError};
-use common::{response, serve};
+use common::{response, serve, serve_with};
+use error::assert_safe_protocol;
 use serde_json::json;
 
 fn operation_error(error: ClientError) -> OperationError {
@@ -18,6 +21,9 @@ fn operation_error(error: ClientError) -> OperationError {
 }
 
 fn protocol_message(error: ClientError) -> String {
+    if let ClientError::Protocol(message) = &error {
+        assert_safe_protocol(&error, message);
+    }
     match error {
         ClientError::Protocol(message) => message,
         other => panic!("expected protocol error, got {other}"),
@@ -106,7 +112,10 @@ fn rejects_oversized_requests() {
             .invoke("svc.op", &json!({ "text": oversized }))
             .unwrap_err(),
     );
-    assert_eq!(message, "operation request is too large");
+    assert_eq!(
+        message,
+        "The request is too large. Reduce the submitted data and try again."
+    );
 }
 
 #[test]
@@ -118,9 +127,63 @@ fn rejects_oversized_responses() {
     let client =
         Client::with_timeout(&origin, std::time::Duration::from_secs(10)).expect("valid origin");
     let message = protocol_message(client.invoke("svc.op", &json!({})).unwrap_err());
-    assert_eq!(message, "operation response is too large");
+    assert_eq!(
+        message,
+        "The response is too large. The operation may have completed; confirm its outcome before requesting less data."
+    );
     let request = receiver.recv().expect("recorded request");
     assert_eq!(request.path, "/svc.op");
+}
+
+#[test]
+fn transport_failures_discard_underlying_details() {
+    let expected = "Could not complete the request. Check your connection and confirm the operation outcome before trying again.";
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let client = Client::new(&origin).unwrap();
+    assert_safe_protocol(&client.invoke("svc.op", &json!({})).unwrap_err(), expected);
+
+    let (release, held) = std::sync::mpsc::channel();
+    let held = std::sync::Mutex::new(held);
+    let (origin, requests) = serve_with(&[response("HTTP/1.1 200 OK", "{}")], move |_| {
+        held.lock().unwrap().recv().unwrap();
+    });
+    let client = Client::with_timeout(&origin, std::time::Duration::from_millis(100)).unwrap();
+    let error = client.invoke("svc.op", &json!({})).unwrap_err();
+    release.send(()).unwrap();
+    assert_safe_protocol(&error, expected);
+    assert_eq!(requests.recv().unwrap().path, "/svc.op");
+
+    let (origin, requests) = serve(&["INVALID synthetic-transport-marker\r\n\r\n".into()]);
+    let client = Client::new(&origin).unwrap();
+    assert_safe_protocol(&client.invoke("svc.op", &json!({})).unwrap_err(), expected);
+    assert_eq!(requests.recv().unwrap().path, "/svc.op");
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("https://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut hello = [0; 1024];
+        stream.read(&mut hello).unwrap();
+        let _ = stream.write_all(b"synthetic-tls-marker");
+    });
+    let client = Client::with_timeout(&origin, std::time::Duration::from_secs(2)).unwrap();
+    assert_safe_protocol(&client.invoke("svc.op", &json!({})).unwrap_err(), expected);
+    server.join().unwrap();
+}
+
+#[test]
+fn truncated_response_discards_body_and_read_error() {
+    let (origin, requests) = serve(&[response("HTTP/1.1 200 OK", "synthetic-body-marker")
+        .replace("content-length: 21", "content-length: 100")]);
+    let client = Client::new(&origin).unwrap();
+    assert_safe_protocol(
+        &client.invoke("svc.op", &json!({})).unwrap_err(),
+        "Could not read the response. Confirm the operation outcome before trying again.",
+    );
+    assert_eq!(requests.recv().unwrap().path, "/svc.op");
 }
 
 #[test]
@@ -191,7 +254,16 @@ fn invalid_error_envelopes_preserve_http_status() {
     ] {
         let (origin, receiver) = serve(&[response("HTTP/1.1 503 Unavailable", body)]);
         let client = Client::new(&origin).expect("valid origin");
-        let error = operation_error(client.invoke("probe.echo", &json!({})).unwrap_err());
+        let error = client.invoke("probe.echo", &json!({})).unwrap_err();
+        assert!(
+            error.to_string()
+                == "operation failed (invalid_response, HTTP 503). Contact the application maintainer."
+        );
+        assert!(
+            format!("{error:?}")
+                == "Operation(OperationError { code: \"invalid_response\", status: 503 })"
+        );
+        let error = operation_error(error);
         assert_eq!(
             (error.code.as_str(), error.status),
             ("invalid_response", 503)

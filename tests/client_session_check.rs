@@ -5,6 +5,8 @@
 mod client;
 
 mod common;
+#[path = "common/error.rs"]
+mod error;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -12,6 +14,7 @@ use std::sync::{Arc, Barrier, Mutex};
 use base64::Engine;
 use client::{Client, ClientError, SessionCredentials, SessionStore};
 use common::{response, serve, serve_with};
+use error::assert_safe_protocol;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -664,7 +667,10 @@ fn timed_out_refresh_is_not_automatically_sent_again() {
         .unwrap()
         .with_session(store.clone())
         .unwrap();
-    assert!(client.invoke("catalog.find", &json!({})).is_err());
+    assert_safe_protocol(
+        &client.invoke("catalog.find", &json!({})).unwrap_err(),
+        "Could not complete the request. Check your connection and confirm the operation outcome before trying again.",
+    );
     release.send(()).unwrap();
     assert_eq!(
         operation_status_and_code(client.invoke("catalog.find", &json!({})).unwrap_err()),
