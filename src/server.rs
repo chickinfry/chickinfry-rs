@@ -203,6 +203,10 @@ pub trait Application {
     /// Whether the project declares a database profile.
     const REQUIRES_DATABASE: bool;
     const EMAIL_PASSWORD_ENABLED: bool = false;
+    /// Successful native refreshes extend the session by this many idle seconds.
+    const SESSION_IDLE_TIMEOUT_SECONDS: u64 = 2_592_000;
+    /// Maximum seconds since first login; zero disables the absolute limit.
+    const SESSION_ABSOLUTE_LIFETIME_SECONDS: u64 = 0;
     const ALLOWED_ORIGINS: &'static [&'static str] = &[];
     fn identity_providers(&self) -> &[Box<dyn crate::auth::IdentityProvider>] {
         &[]
@@ -397,7 +401,13 @@ async fn serve_inner<A: Application>(
             DatabasePort::new(rid),
             application.identity_providers(),
             &hooks,
-        ) {
+        )
+        .and_then(|auth| {
+            auth.with_session_policy(
+                A::SESSION_IDLE_TIMEOUT_SECONDS,
+                A::SESSION_ABSOLUTE_LIFETIME_SECONDS,
+            )
+        }) {
             Ok(auth) => auth,
             Err(error) => return Ok(error_envelope(error.status, &error.code)),
         };

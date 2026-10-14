@@ -61,6 +61,7 @@ pub struct Auth<'a, H> {
     db: Database,
     providers: &'a [Box<dyn IdentityProvider>],
     hooks: &'a H,
+    session_policy: SessionPolicy,
 }
 
 impl<'a, H: UserCreationHooks> Auth<'a, H> {
@@ -88,7 +89,17 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
             db: Database::new(port),
             providers,
             hooks,
+            session_policy: SessionPolicy::new(2_592_000, 0)?,
         })
+    }
+
+    pub(crate) fn with_session_policy(
+        mut self,
+        idle_seconds: u64,
+        absolute_seconds: u64,
+    ) -> Result<Self, OperationError> {
+        self.session_policy = SessionPolicy::new(idle_seconds, absolute_seconds)?;
+        Ok(self)
     }
 
     pub async fn signup(&self, email: &str, password: &str) -> Result<Tokens, OperationError> {
@@ -271,31 +282,95 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                 ..Default::default()
             })
             .await?;
-        let session = rows
-            .first()
-            .filter(|row| row.revoked_at.is_none())
-            .ok_or_else(OperationError::invalid_token)?;
-        if expired(&session.expires_at)? {
-            return Err(OperationError::invalid_token());
-        }
-        let user = self
+        let stored = rows.first().ok_or_else(OperationError::invalid_token)?;
+        let outcome = self
             .db
-            .app_auth_users
-            .find_by_id(AppAuthUsersPrimaryKey {
-                id: session.user_id.clone(),
+            .transaction(async |tx| {
+                let columns = tx.app_auth_sessions.columns();
+                let session = tx
+                    .app_auth_sessions
+                    .update_if(
+                        AppAuthSessionsPrimaryKey {
+                            id: stored.id.clone(),
+                        },
+                        Filter::all(vec![
+                            Filter::is_null(columns.revoked_at),
+                            Filter::eq(columns.token_hash, json!(token_digest(token))),
+                            Filter::eq(columns.transport, json!("native")),
+                        ]),
+                        AppAuthSessionsUpdate {
+                            revoked_at: Some(None),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                let Some(session) = session else {
+                    return Ok(None);
+                };
+                let legacy_refresh = if session.first_login_at.is_none() {
+                    tx.app_auth_refresh_tokens
+                        .find_many(FindMany {
+                            filter: Some(Filter::all(vec![
+                                Filter::eq(
+                                    tx.app_auth_refresh_tokens.columns().session_id,
+                                    json!(session.id),
+                                ),
+                                Filter::is_null(tx.app_auth_refresh_tokens.columns().consumed_at),
+                            ])),
+                            limit: Some(1),
+                            ..Default::default()
+                        })
+                        .await?
+                        .into_iter()
+                        .next()
+                } else {
+                    None
+                };
+                let user = tx
+                    .app_auth_users
+                    .find_by_id(AppAuthUsersPrimaryKey {
+                        id: session.user_id.clone(),
+                    })
+                    .await?;
+                let now = now_millis();
+                if self.session_policy.expired(
+                    now,
+                    session.first_login_at.as_deref(),
+                    &session.created_at,
+                    session.last_renewed_at.as_deref(),
+                    legacy_refresh.as_ref().map(|row| row.created_at.as_str()),
+                    legacy_refresh.as_ref().map(|row| row.expires_at.as_str()),
+                )? {
+                    tx.app_auth_sessions
+                        .update(
+                            AppAuthSessionsPrimaryKey { id: session.id },
+                            AppAuthSessionsUpdate {
+                                revoked_at: Some(Some(timestamp_at(now)?)),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    return Ok(None);
+                }
+                if now >= parse_timestamp(&session.expires_at)? {
+                    return Ok(None);
+                }
+                let Some(user) = user.filter(|user| {
+                    user.disabled_at.is_none()
+                        && user.session_version == session.user_session_version
+                }) else {
+                    return Ok(None);
+                };
+                Ok(Some(Session {
+                    id: session.id,
+                    user: SessionUser {
+                        id: user.id,
+                        email: user.email,
+                    },
+                }))
             })
-            .await?
-            .filter(|user| {
-                user.disabled_at.is_none() && user.session_version == session.user_session_version
-            })
-            .ok_or_else(OperationError::invalid_token)?;
-        Ok(Session {
-            id: session.id.clone(),
-            user: SessionUser {
-                id: user.id,
-                email: user.email,
-            },
-        })
+            .await?;
+        outcome.ok_or_else(OperationError::invalid_token)
     }
 
     pub async fn logout(&self, token: &str) -> Result<(), OperationError> {
@@ -338,7 +413,10 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                         AppAuthSessionsPrimaryKey {
                             id: stored.session_id.clone(),
                         },
-                        Filter::is_null(tx.app_auth_sessions.columns().revoked_at),
+                        Filter::all(vec![
+                            Filter::is_null(tx.app_auth_sessions.columns().revoked_at),
+                            Filter::eq(tx.app_auth_sessions.columns().transport, json!("native")),
+                        ]),
                         AppAuthSessionsUpdate {
                             revoked_at: Some(None),
                             ..Default::default()
@@ -360,10 +438,18 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                         id: session.user_id.clone(),
                     })
                     .await?;
+                let now = now_millis();
                 let valid = match (&current, &user) {
                     (Some(current), Some(user)) => {
                         current.consumed_at.is_none()
-                            && !expired(&current.expires_at)?
+                            && !self.session_policy.expired(
+                                now,
+                                session.first_login_at.as_deref(),
+                                &session.created_at,
+                                session.last_renewed_at.as_deref(),
+                                Some(&current.created_at),
+                                Some(&current.expires_at),
+                            )?
                             && user.disabled_at.is_none()
                             && user.session_version == session.user_session_version
                     }
@@ -374,7 +460,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                         .update(
                             AppAuthSessionsPrimaryKey { id: session.id },
                             AppAuthSessionsUpdate {
-                                revoked_at: Some(Some(timestamp(0)?)),
+                                revoked_at: Some(Some(timestamp_at(now)?)),
                                 ..Default::default()
                             },
                         )
@@ -388,7 +474,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                         AppAuthRefreshTokensPrimaryKey { id: current.id },
                         Filter::is_null(tx.app_auth_refresh_tokens.columns().consumed_at),
                         AppAuthRefreshTokensUpdate {
-                            consumed_at: Some(Some(timestamp(0)?)),
+                            consumed_at: Some(Some(timestamp_at(now)?)),
                             ..Default::default()
                         },
                     )
@@ -398,7 +484,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                         .update(
                             AppAuthSessionsPrimaryKey { id: session.id },
                             AppAuthSessionsUpdate {
-                                revoked_at: Some(Some(timestamp(0)?)),
+                                revoked_at: Some(Some(timestamp_at(now)?)),
                                 ..Default::default()
                             },
                         )
@@ -407,7 +493,18 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                 }
                 let access_token = random_token()?;
                 let refresh_token = random_token()?;
-                let expires_at = timestamp(900_000)?;
+                let expires_at = timestamp_at(now + 900_000)?;
+                let refresh_expires_at = timestamp_at(
+                    self.session_policy.expires_at(
+                        parse_timestamp(
+                            session
+                                .first_login_at
+                                .as_deref()
+                                .unwrap_or(&session.created_at),
+                        )?,
+                        now,
+                    ),
+                )?;
                 tx.app_auth_sessions
                     .update(
                         AppAuthSessionsPrimaryKey {
@@ -416,6 +513,10 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                         AppAuthSessionsUpdate {
                             token_hash: Some(token_digest(&access_token)),
                             expires_at: Some(expires_at.clone()),
+                            first_login_at: Some(Some(
+                                session.first_login_at.clone().unwrap_or(session.created_at),
+                            )),
+                            last_renewed_at: Some(Some(timestamp_at(now)?)),
                             ..Default::default()
                         },
                     )
@@ -424,9 +525,9 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                     .insert(AppAuthRefreshTokensInsert {
                         session_id: session.id.clone(),
                         token_hash: token_digest(&refresh_token),
-                        expires_at: current.expires_at.clone(),
+                        expires_at: refresh_expires_at.clone(),
                         consumed_at: None,
-                        created_at: None,
+                        created_at: Some(timestamp_at(now)?),
                         id: None,
                     })
                     .await?;
@@ -434,7 +535,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                     access_token,
                     refresh_token,
                     expires_at,
-                    refresh_expires_at: current.expires_at,
+                    refresh_expires_at,
                     user_id: session.user_id,
                     session_id: session.id,
                 }))
@@ -450,8 +551,9 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
     ) -> Result<Tokens, OperationError> {
         let access_token = random_token()?;
         let refresh_token = random_token()?;
-        let expires_at = timestamp(900_000)?;
-        let refresh_expires_at = timestamp(604_800_000)?;
+        let now = now_millis();
+        let expires_at = timestamp_at(now + 900_000)?;
+        let refresh_expires_at = timestamp_at(self.session_policy.expires_at(now, now))?;
         let session = tx
             .app_auth_sessions
             .insert(AppAuthSessionsInsert {
@@ -461,7 +563,10 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                 expires_at: expires_at.clone(),
                 revoked_at: None,
                 id: None,
-                created_at: None,
+                created_at: Some(timestamp_at(now)?),
+                first_login_at: Some(Some(timestamp_at(now)?)),
+                last_renewed_at: Some(Some(timestamp_at(now)?)),
+                transport: None,
             })
             .await?;
         tx.app_auth_refresh_tokens
@@ -470,7 +575,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                 token_hash: token_digest(&refresh_token),
                 expires_at: refresh_expires_at.clone(),
                 consumed_at: None,
-                created_at: None,
+                created_at: Some(timestamp_at(now)?),
                 id: None,
             })
             .await?;
@@ -602,17 +707,83 @@ fn validate_token(token: &str) -> Result<(), OperationError> {
     Ok(())
 }
 
+struct SessionPolicy {
+    idle_millis: i64,
+    absolute_millis: i64,
+}
+
+impl SessionPolicy {
+    fn new(idle_seconds: u64, absolute_seconds: u64) -> Result<Self, OperationError> {
+        if !(3_600..=31_536_000).contains(&idle_seconds)
+            || absolute_seconds != 0 && !(3_600..=31_536_000).contains(&absolute_seconds)
+        {
+            return Err(OperationError::new("invalid_session_policy", 500));
+        }
+        Ok(Self {
+            idle_millis: idle_seconds as i64 * 1_000,
+            absolute_millis: absolute_seconds as i64 * 1_000,
+        })
+    }
+
+    fn expires_at(&self, first_login: i64, last_rotation: i64) -> i64 {
+        let idle = last_rotation.saturating_add(self.idle_millis);
+        if self.absolute_millis == 0 {
+            idle
+        } else {
+            idle.min(first_login.saturating_add(self.absolute_millis))
+        }
+    }
+
+    fn expired(
+        &self,
+        now: i64,
+        first_login_at: Option<&str>,
+        family_created_at: &str,
+        last_renewed_at: Option<&str>,
+        latest_refresh_created_at: Option<&str>,
+        stored_expires_at: Option<&str>,
+    ) -> Result<bool, OperationError> {
+        if first_login_at.is_none()
+            && now >= parse_timestamp(stored_expires_at.ok_or_else(OperationError::internal)?)?
+        {
+            return Ok(true);
+        }
+        let first_login = parse_timestamp(first_login_at.unwrap_or(family_created_at))?;
+        let last_renewed = if first_login_at.is_none() {
+            parse_timestamp(latest_refresh_created_at.ok_or_else(OperationError::internal)?)?
+        } else {
+            last_renewed_at
+                .map(parse_timestamp)
+                .transpose()?
+                .unwrap_or(first_login)
+        };
+        Ok(now >= self.expires_at(first_login, last_renewed))
+    }
+}
+
+fn now_millis() -> i64 {
+    js_sys::Date::now() as i64
+}
+
 fn timestamp(delta: i64) -> Result<String, OperationError> {
-    DateTime::<Utc>::from_timestamp_millis(js_sys::Date::now() as i64 + delta)
+    timestamp_at(now_millis() + delta)
+}
+
+fn timestamp_at(millis: i64) -> Result<String, OperationError> {
+    DateTime::<Utc>::from_timestamp_millis(millis)
         .map(|date| date.to_rfc3339_opts(SecondsFormat::Millis, true))
         .ok_or_else(OperationError::internal)
 }
 
 fn expired(value: &str) -> Result<bool, OperationError> {
+    Ok(parse_timestamp(value)? <= now_millis())
+}
+
+fn parse_timestamp(value: &str) -> Result<i64, OperationError> {
     let parsed = DateTime::parse_from_rfc3339(value)
         .or_else(|_| DateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f%#z"))
         .map_err(|_| OperationError::internal())?;
-    Ok(parsed.timestamp_millis() <= js_sys::Date::now() as i64)
+    Ok(parsed.timestamp_millis())
 }
 
 fn hash_password(password: &str) -> Result<String, OperationError> {
@@ -661,4 +832,196 @@ fn random_token() -> Result<String, OperationError> {
 
 fn token_digest(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DAY: i64 = 86_400_000;
+
+    fn checked<T>(result: Result<T, OperationError>) -> T {
+        result.unwrap_or_else(|error| panic!("{}", error.code))
+    }
+
+    fn is_expired(policy: &SessionPolicy, now: i64, renewed: i64, stored: i64) -> bool {
+        checked(policy.expired(
+            now,
+            Some(&checked(timestamp_at(0))),
+            &checked(timestamp_at(0)),
+            Some(&checked(timestamp_at(renewed))),
+            None,
+            Some(&checked(timestamp_at(stored))),
+        ))
+    }
+
+    #[test]
+    fn a05_successful_rotations_extend_beyond_seven_days() {
+        let policy = checked(SessionPolicy::new(2_592_000, 0));
+        let mut last_renewed = 0;
+        let mut deadline = 30 * DAY;
+        for (rotation, expected) in [(29 * DAY, 59 * DAY), (31 * DAY, 61 * DAY)] {
+            assert!(!is_expired(&policy, rotation, last_renewed, deadline));
+            deadline = policy.expires_at(0, rotation);
+            assert_eq!(deadline, expected);
+            last_renewed = rotation;
+        }
+    }
+
+    #[test]
+    fn a06_idle_expiry_is_inclusive() {
+        let policy = checked(SessionPolicy::new(2_592_000, 0));
+        for (now, expired) in [
+            (30 * DAY - 1_000, false),
+            (30 * DAY, true),
+            (30 * DAY + 1_000, true),
+        ] {
+            assert_eq!(is_expired(&policy, now, 0, 30 * DAY), expired);
+        }
+    }
+
+    #[test]
+    fn a07_absolute_cap_survives_rotation_and_remaining_access_lifetime() {
+        let policy = checked(SessionPolicy::new(2_592_000, 5_184_000));
+        assert_eq!(policy.expires_at(0, 29 * DAY), 59 * DAY);
+        assert_eq!(policy.expires_at(0, 58 * DAY), 60 * DAY);
+        for (now, expired) in [
+            (60 * DAY - 1_000, false),
+            (60 * DAY, true),
+            (60 * DAY + 1_000, true),
+        ] {
+            assert_eq!(is_expired(&policy, now, 58 * DAY, 60 * DAY), expired);
+        }
+        let last_renewed = 60 * DAY - 1_000;
+        assert!(last_renewed + 900_000 > 60 * DAY);
+        assert!(is_expired(
+            &policy,
+            60 * DAY,
+            last_renewed,
+            policy.expires_at(0, last_renewed)
+        ));
+        assert_eq!(
+            checked(SessionPolicy::new(2_592_000, 3_600)).expires_at(0, 0),
+            3_600_000
+        );
+    }
+
+    #[test]
+    fn current_policy_shortening_applies_to_existing_sessions() {
+        assert!(!is_expired(
+            &checked(SessionPolicy::new(2_592_000, 0)),
+            3 * DAY,
+            DAY,
+            31 * DAY
+        ));
+        assert!(is_expired(
+            &checked(SessionPolicy::new(86_400, 0)),
+            3 * DAY,
+            DAY,
+            31 * DAY
+        ));
+        assert!(is_expired(
+            &checked(SessionPolicy::new(2_592_000, 172_800)),
+            3 * DAY,
+            DAY,
+            31 * DAY
+        ));
+    }
+
+    #[test]
+    fn current_policy_expansion_ignores_old_deadlines_after_transition() {
+        let policy = checked(SessionPolicy::new(2_592_000, 0));
+        assert!(!is_expired(&policy, 8 * DAY, 0, 7 * DAY));
+        let first_login = checked(timestamp_at(DAY));
+        assert!(!checked(policy.expired(
+            30 * DAY,
+            Some(&first_login),
+            &checked(timestamp_at(0)),
+            None,
+            None,
+            None
+        )));
+    }
+
+    #[test]
+    fn legacy_sessions_use_family_creation_and_never_revive_after_expiry() {
+        let policy = checked(SessionPolicy::new(2_592_000, 0));
+        for (now, expired) in [(7 * DAY - 1, false), (7 * DAY, true), (8 * DAY, true)] {
+            assert_eq!(
+                checked(policy.expired(
+                    now,
+                    None,
+                    &checked(timestamp_at(0)),
+                    None,
+                    Some(&checked(timestamp_at(6 * DAY))),
+                    Some(&checked(timestamp_at(7 * DAY)))
+                )),
+                expired
+            );
+        }
+        let capped = checked(SessionPolicy::new(2_592_000, 86_400));
+        assert!(checked(capped.expired(
+            DAY,
+            None,
+            &checked(timestamp_at(0)),
+            None,
+            Some(&checked(timestamp_at(DAY))),
+            Some(&checked(timestamp_at(7 * DAY)))
+        )));
+        assert_eq!(policy.expires_at(0, 6 * DAY), 36 * DAY);
+    }
+
+    #[test]
+    fn legacy_idle_uses_latest_refresh_issuance_and_expires_at_the_boundary() {
+        let policy = checked(SessionPolicy::new(3_600, 0));
+        let latest_refresh = 6 * DAY - 600_000;
+        for (now, expired) in [
+            (6 * DAY, false),
+            (latest_refresh + 3_600_000 - 1, false),
+            (latest_refresh + 3_600_000, true),
+        ] {
+            assert_eq!(
+                checked(policy.expired(
+                    now,
+                    None,
+                    &checked(timestamp_at(0)),
+                    None,
+                    Some(&checked(timestamp_at(latest_refresh))),
+                    Some(&checked(timestamp_at(7 * DAY))),
+                )),
+                expired
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_policies_and_malformed_timestamps_fail_closed() {
+        for (idle, absolute) in [
+            (0, 0),
+            (3_599, 0),
+            (31_536_001, 0),
+            (3_600, 1),
+            (3_600, 31_536_001),
+            (u64::MAX, 0),
+        ] {
+            assert_eq!(
+                SessionPolicy::new(idle, absolute).err().unwrap().code,
+                "invalid_session_policy"
+            );
+        }
+        for (idle, absolute) in [(3_600, 0), (31_536_000, 3_600), (3_600, 31_536_000)] {
+            assert!(SessionPolicy::new(idle, absolute).is_ok());
+        }
+        let policy = checked(SessionPolicy::new(2_592_000, 0));
+        assert!(
+            policy
+                .expired(DAY, Some("invalid"), "invalid", None, None, None)
+                .is_err()
+        );
+        assert!(
+            policy
+                .expired(DAY, None, "invalid", None, None, None)
+                .is_err()
+        );
+    }
 }

@@ -115,6 +115,156 @@ impl AppAuthIdentitiesRepository {
     }
 }
 
+static APP_AUTH_INVITES_TABLE: TableDefinition = TableDefinition::new(
+    "app_auth_invites",
+    &["id", ],
+    &[
+        Column::new("code_hash", Kind::Text, false, false, true, ""),
+        Column::new("created_at", Kind::Timestamp, false, true, false, ""),
+        Column::new("email", Kind::Text, false, false, false, ""),
+        Column::new("expires_at", Kind::Timestamp, false, false, false, ""),
+        Column::new("id", Kind::Id, false, true, false, ""),
+        Column::new("issued_by", Kind::Id, false, false, false, "app_auth_users.id"),
+        Column::new("redeemed_at", Kind::Timestamp, true, true, false, ""),
+        Column::new("redeemed_by", Kind::Id, true, true, false, "app_auth_users.id"),
+        Column::new("revoked_at", Kind::Timestamp, true, true, false, ""),
+    ],
+);
+
+#[derive(Debug, Clone, chickinfry::serde::Serialize, chickinfry::serde::Deserialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthInvitesRow {
+    pub code_hash: String,
+    pub created_at: String,
+    pub email: String,
+    pub expires_at: String,
+    pub id: String,
+    pub issued_by: String,
+    pub redeemed_at: Option<String>,
+    pub redeemed_by: Option<String>,
+    pub revoked_at: Option<String>,
+}
+
+#[derive(Debug, chickinfry::serde::Serialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthInvitesInsert {
+    pub code_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    pub email: String,
+    pub expires_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub issued_by: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redeemed_at: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redeemed_by: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<Option<String>>,
+}
+
+/// The patch for one primary-key-addressed row. Primary-key columns are
+/// absent, so updates can never move a row identity.
+#[derive(Debug, Default, chickinfry::serde::Serialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthInvitesUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issued_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redeemed_at: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redeemed_by: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<Option<String>>,
+}
+
+#[derive(Debug, chickinfry::serde::Deserialize, chickinfry::serde::Serialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthInvitesPrimaryKey {
+    pub id: String,
+}
+
+pub struct AppAuthInvitesRepository(chickinfry::orm::Repository);
+
+pub struct AppAuthInvitesColumns {
+    pub code_hash: Column,
+    pub created_at: Column,
+    pub email: Column,
+    pub expires_at: Column,
+    pub id: Column,
+    pub issued_by: Column,
+    pub redeemed_at: Column,
+    pub redeemed_by: Column,
+    pub revoked_at: Column,
+}
+
+impl AppAuthInvitesRepository {
+
+    pub fn columns(&self) -> AppAuthInvitesColumns {
+        AppAuthInvitesColumns {
+            code_hash: Column::new("code_hash", Kind::Text, false, false, true, ""),
+            created_at: Column::new("created_at", Kind::Timestamp, false, true, false, ""),
+            email: Column::new("email", Kind::Text, false, false, false, ""),
+            expires_at: Column::new("expires_at", Kind::Timestamp, false, false, false, ""),
+            id: Column::new("id", Kind::Id, false, true, false, ""),
+            issued_by: Column::new("issued_by", Kind::Id, false, false, false, "app_auth_users.id"),
+            redeemed_at: Column::new("redeemed_at", Kind::Timestamp, true, true, false, ""),
+            redeemed_by: Column::new("redeemed_by", Kind::Id, true, true, false, "app_auth_users.id"),
+            revoked_at: Column::new("revoked_at", Kind::Timestamp, true, true, false, ""),
+        }
+    }
+    pub(crate) fn new(repository: chickinfry::orm::Repository) -> Self {
+        Self(repository)
+    }
+
+    pub async fn insert(&self, insert: AppAuthInvitesInsert) -> Result<AppAuthInvitesRow, OperationError> {
+        let value = chickinfry::serde_json::to_value(&insert)
+            .map_err(|_| OperationError::internal())?;
+        self.0.insert(&value).await
+    }
+
+    pub async fn find_by_id(&self, key: AppAuthInvitesPrimaryKey) -> Result<Option<AppAuthInvitesRow>, OperationError> {
+        let value = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        self.0.find_by_id(&value).await
+    }
+
+    pub async fn find_many(&self, options: FindMany) -> Result<Vec<AppAuthInvitesRow>, OperationError> {
+        self.0.find_many(options).await
+    }
+
+    pub async fn update(&self, key: AppAuthInvitesPrimaryKey, patch: AppAuthInvitesUpdate) -> Result<AppAuthInvitesRow, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let patch = chickinfry::serde_json::to_value(&patch)
+            .map_err(|_| OperationError::internal())?;
+        self.0.update(&key, &patch).await
+    }
+
+    pub async fn update_if(&self, key: AppAuthInvitesPrimaryKey, filter: chickinfry::orm::Filter, patch: AppAuthInvitesUpdate) -> Result<Option<AppAuthInvitesRow>, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let patch = chickinfry::serde_json::to_value(&patch)
+            .map_err(|_| OperationError::internal())?;
+        self.0.update_if(&key, &filter, &patch).await
+    }
+
+    pub async fn delete(&self, key: AppAuthInvitesPrimaryKey) -> Result<bool, OperationError> {
+        let value = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        self.0.delete(&value).await
+    }
+}
+
 static APP_AUTH_RATE_LIMITS_TABLE: TableDefinition = TableDefinition::new(
     "app_auth_rate_limits",
     &["action", "key_hash", ],
@@ -357,9 +507,12 @@ static APP_AUTH_SESSIONS_TABLE: TableDefinition = TableDefinition::new(
     &[
         Column::new("created_at", Kind::Timestamp, false, true, false, ""),
         Column::new("expires_at", Kind::Timestamp, false, false, false, ""),
+        Column::new("first_login_at", Kind::Timestamp, true, true, false, ""),
         Column::new("id", Kind::Id, false, true, false, ""),
+        Column::new("last_renewed_at", Kind::Timestamp, true, true, false, ""),
         Column::new("revoked_at", Kind::Timestamp, true, true, false, ""),
         Column::new("token_hash", Kind::Text, false, false, true, ""),
+        Column::new("transport", Kind::Text, false, true, false, ""),
         Column::new("user_id", Kind::Id, false, false, false, "app_auth_users.id"),
         Column::new("user_session_version", Kind::Integer, false, false, false, ""),
     ],
@@ -370,9 +523,12 @@ static APP_AUTH_SESSIONS_TABLE: TableDefinition = TableDefinition::new(
 pub struct AppAuthSessionsRow {
     pub created_at: String,
     pub expires_at: String,
+    pub first_login_at: Option<String>,
     pub id: String,
+    pub last_renewed_at: Option<String>,
     pub revoked_at: Option<String>,
     pub token_hash: String,
+    pub transport: String,
     pub user_id: String,
     pub user_session_version: i32,
 }
@@ -384,10 +540,16 @@ pub struct AppAuthSessionsInsert {
     pub created_at: Option<String>,
     pub expires_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_login_at: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_renewed_at: Option<Option<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revoked_at: Option<Option<String>>,
     pub token_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
     pub user_id: String,
     pub user_session_version: i32,
 }
@@ -402,9 +564,15 @@ pub struct AppAuthSessionsUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_login_at: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_renewed_at: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub revoked_at: Option<Option<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -422,9 +590,12 @@ pub struct AppAuthSessionsRepository(chickinfry::orm::Repository);
 pub struct AppAuthSessionsColumns {
     pub created_at: Column,
     pub expires_at: Column,
+    pub first_login_at: Column,
     pub id: Column,
+    pub last_renewed_at: Column,
     pub revoked_at: Column,
     pub token_hash: Column,
+    pub transport: Column,
     pub user_id: Column,
     pub user_session_version: Column,
 }
@@ -435,9 +606,12 @@ impl AppAuthSessionsRepository {
         AppAuthSessionsColumns {
             created_at: Column::new("created_at", Kind::Timestamp, false, true, false, ""),
             expires_at: Column::new("expires_at", Kind::Timestamp, false, false, false, ""),
+            first_login_at: Column::new("first_login_at", Kind::Timestamp, true, true, false, ""),
             id: Column::new("id", Kind::Id, false, true, false, ""),
+            last_renewed_at: Column::new("last_renewed_at", Kind::Timestamp, true, true, false, ""),
             revoked_at: Column::new("revoked_at", Kind::Timestamp, true, true, false, ""),
             token_hash: Column::new("token_hash", Kind::Text, false, false, true, ""),
+            transport: Column::new("transport", Kind::Text, false, true, false, ""),
             user_id: Column::new("user_id", Kind::Id, false, false, false, "app_auth_users.id"),
             user_session_version: Column::new("user_session_version", Kind::Integer, false, false, false, ""),
         }
@@ -615,8 +789,9 @@ impl AppAuthUsersRepository {
 }
 
 pub struct Database {
-    port: chickinfry::database::DatabasePort,
+    _port: chickinfry::database::DatabasePort,
     pub app_auth_identities: AppAuthIdentitiesRepository,
+    pub app_auth_invites: AppAuthInvitesRepository,
     pub app_auth_rate_limits: AppAuthRateLimitsRepository,
     pub app_auth_refresh_tokens: AppAuthRefreshTokensRepository,
     pub app_auth_sessions: AppAuthSessionsRepository,
@@ -626,8 +801,9 @@ pub struct Database {
 impl Database {
     pub fn new(port: DatabasePort) -> Database {
         Database {
-            port,
+            _port: port,
             app_auth_identities: AppAuthIdentitiesRepository::new(Repository::new(&APP_AUTH_IDENTITIES_TABLE, port)),
+            app_auth_invites: AppAuthInvitesRepository::new(Repository::new(&APP_AUTH_INVITES_TABLE, port)),
             app_auth_rate_limits: AppAuthRateLimitsRepository::new(Repository::new(&APP_AUTH_RATE_LIMITS_TABLE, port)),
             app_auth_refresh_tokens: AppAuthRefreshTokensRepository::new(Repository::new(&APP_AUTH_REFRESH_TOKENS_TABLE, port)),
             app_auth_sessions: AppAuthSessionsRepository::new(Repository::new(&APP_AUTH_SESSIONS_TABLE, port)),
@@ -637,8 +813,9 @@ impl Database {
 
     pub fn transaction_port(port: TransactionPort) -> TransactionDatabase {
         TransactionDatabase {
-            port,
+            _port: port,
             app_auth_identities: AppAuthIdentitiesRepository::new(Repository::transactional(&APP_AUTH_IDENTITIES_TABLE, Connection::Transactional(port))),
+            app_auth_invites: AppAuthInvitesRepository::new(Repository::transactional(&APP_AUTH_INVITES_TABLE, Connection::Transactional(port))),
             app_auth_rate_limits: AppAuthRateLimitsRepository::new(Repository::transactional(&APP_AUTH_RATE_LIMITS_TABLE, Connection::Transactional(port))),
             app_auth_refresh_tokens: AppAuthRefreshTokensRepository::new(Repository::transactional(&APP_AUTH_REFRESH_TOKENS_TABLE, Connection::Transactional(port))),
             app_auth_sessions: AppAuthSessionsRepository::new(Repository::transactional(&APP_AUTH_SESSIONS_TABLE, Connection::Transactional(port))),
@@ -653,10 +830,11 @@ impl Database {
         &self,
         work: impl AsyncFnOnce(&mut TransactionDatabase) -> Result<T, OperationError>,
     ) -> Result<T, OperationError> {
-        let lease = TransactionPort::begin(self.port).await?;
+        let lease = TransactionPort::begin(self._port).await?;
         let mut database = TransactionDatabase {
-            port: lease,
+            _port: lease,
             app_auth_identities: AppAuthIdentitiesRepository::new(Repository::transactional(&APP_AUTH_IDENTITIES_TABLE, Connection::Transactional(lease))),
+            app_auth_invites: AppAuthInvitesRepository::new(Repository::transactional(&APP_AUTH_INVITES_TABLE, Connection::Transactional(lease))),
             app_auth_rate_limits: AppAuthRateLimitsRepository::new(Repository::transactional(&APP_AUTH_RATE_LIMITS_TABLE, Connection::Transactional(lease))),
             app_auth_refresh_tokens: AppAuthRefreshTokensRepository::new(Repository::transactional(&APP_AUTH_REFRESH_TOKENS_TABLE, Connection::Transactional(lease))),
             app_auth_sessions: AppAuthSessionsRepository::new(Repository::transactional(&APP_AUTH_SESSIONS_TABLE, Connection::Transactional(lease))),
@@ -676,8 +854,9 @@ impl Database {
 }
 
 pub struct TransactionDatabase {
-    port: TransactionPort,
+    _port: TransactionPort,
     pub app_auth_identities: AppAuthIdentitiesRepository,
+    pub app_auth_invites: AppAuthInvitesRepository,
     pub app_auth_rate_limits: AppAuthRateLimitsRepository,
     pub app_auth_refresh_tokens: AppAuthRefreshTokensRepository,
     pub app_auth_sessions: AppAuthSessionsRepository,
@@ -686,6 +865,6 @@ pub struct TransactionDatabase {
 
 impl TransactionDatabase {
     pub fn port(&self) -> TransactionPort {
-        self.port
+        self._port
     }
 }
