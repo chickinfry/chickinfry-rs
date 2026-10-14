@@ -4,16 +4,20 @@ This separate Cargo package runs actual generated Rust SDK methods. The shared
 coordinator owns peers, fixtures, clocks, builds, deadlines and case verdicts.
 The driver is not a runtime workspace member; root CI does not test this package.
 
+Rust support is in development and is not yet listed as supported. Results from
+this driver are evidence toward that decision, not a support claim.
+
 ## Prepare a pinned declaration
 
-The shared conformance README's declaration example (lines 41–52) requires
-`driverCommit`; its build contract (lines 60–72) fixes compiler inputs. The
-coordinator validates a full 40-character commit before building. A committed
+The conformance coordinator requires each declaration to carry `driverCommit`,
+the full 40-character commit of the driver source, and validates it before
+building. The coordinator also fixes every compiler input itself; a declaration
+supplies only the tool, the entry path and the feature list. A committed
 declaration cannot contain its own commit hash, so `driver.json.template` is
 materialized at the root of a temporary source export, beside the runtime's
 `Cargo.toml`. This preserves the runtime source and enables its owned Cargo patch.
-Keep the generated root declaration outside Git: the public export excludes only
-`.github`, so a tracked root declaration would be exported.
+Do not commit the generated root declaration; it belongs to one run and would
+otherwise ship with the source.
 
 From a clean, committed repository root:
 
