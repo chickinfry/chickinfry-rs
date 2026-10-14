@@ -762,7 +762,14 @@ impl SessionPolicy {
 }
 
 fn now_millis() -> i64 {
-    js_sys::Date::now() as i64
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    {
+        crate::host::testing::NOW
+    }
+    #[cfg(not(all(test, not(target_arch = "wasm32"))))]
+    {
+        js_sys::Date::now() as i64
+    }
 }
 
 fn timestamp(delta: i64) -> Result<String, OperationError> {
@@ -839,6 +846,263 @@ mod tests {
     use super::*;
 
     const DAY: i64 = 86_400_000;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod rolling {
+        use super::*;
+        use crate::host::testing;
+        use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+
+        const SESSION_ID: &str = "00000000-0000-4000-8000-000000000001";
+        const USER_ID: &str = "00000000-0000-4000-8000-000000000002";
+        const REFRESH_ID: &str = "00000000-0000-4000-8000-000000000003";
+
+        fn session() -> Value {
+            json!({
+                "id": SESSION_ID, "user_id": USER_ID, "user_session_version": 1,
+                "created_at": checked(timestamp_at(testing::NOW - 10 * DAY)),
+                "first_login_at": checked(timestamp_at(testing::NOW - 10 * DAY)),
+                "last_renewed_at": checked(timestamp_at(testing::NOW - 600_000)),
+                "expires_at": checked(timestamp_at(testing::NOW + 900_000)),
+                "revoked_at": null, "token_hash": "", "transport": "native"
+            })
+        }
+
+        fn refresh() -> Value {
+            json!({
+                "id": REFRESH_ID, "session_id": SESSION_ID, "token_hash": "",
+                "created_at": checked(timestamp_at(testing::NOW - 600_000)),
+                "expires_at": checked(timestamp_at(testing::NOW + DAY)),
+                "consumed_at": null
+            })
+        }
+
+        fn user() -> Value {
+            json!({
+                "id": USER_ID, "email": "user@example.test", "session_version": 1,
+                "created_at": checked(timestamp_at(0)),
+                "disabled_at": null, "password_hash": null
+            })
+        }
+
+        fn rows(row: Value) -> Value {
+            json!({"rows": [row]})
+        }
+
+        fn run<T>(
+            script: Vec<(&'static str, Value)>,
+            future: impl Future<Output = T>,
+        ) -> (T, Vec<Value>) {
+            let calls = Rc::new(RefCell::new(Vec::new()));
+            let recorded = calls.clone();
+            let mut responses: VecDeque<_> = script.into();
+            let result = testing::run(
+                move |request| {
+                    let (op, response) = responses.pop_front().expect("unexpected host call");
+                    assert!(request["op"] == op, "unexpected transaction operation");
+                    assert!(request["rid"] == 1, "request changed database connection");
+                    if op == "exec" || op == "commit" {
+                        assert!(request["lease"] == 7, "transaction changed database lease");
+                    }
+                    // An expiry predicate would hide a consumed credential before reuse detection.
+                    let hides_expired = op == "query"
+                        && request["sql"]
+                            .as_str()
+                            .unwrap()
+                            .split(" where ")
+                            .nth(1)
+                            .is_some_and(|filter| filter.contains("\"expires_at\""));
+                    recorded.borrow_mut().push(request);
+                    if hides_expired {
+                        json!({"rows": []})
+                    } else {
+                        response
+                    }
+                },
+                future,
+            );
+            let calls = calls.take();
+            (result, calls)
+        }
+
+        fn assignment<'a>(request: &'a Value, column: &str) -> Option<&'a Value> {
+            let sql = request["sql"].as_str()?;
+            let assignments = sql.split_once(" set ")?.1.split_once(" where ")?.0;
+            for term in assignments.split(", ") {
+                let (name, index) = term.split_once(" = $").unwrap();
+                if name.trim_matches('"') == column {
+                    return request["params"].get(index.parse::<usize>().unwrap() - 1);
+                }
+            }
+            None
+        }
+
+        fn assert_revoked_and_committed(calls: &[Value]) {
+            let revocation = &calls[calls.len() - 2];
+            assert!(
+                revocation["sql"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("update \"app_auth_sessions\"")
+            );
+            assert!(
+                assignment(revocation, "revoked_at")
+                    == Some(&json!(checked(timestamp_at(testing::NOW))))
+            );
+            assert!(
+                calls.last().unwrap()["op"] == "commit",
+                "revocation was not committed"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .all(|call| assignment(call, "first_login_at").is_none()
+                        && assignment(call, "last_renewed_at").is_none())
+            );
+        }
+
+        #[test]
+        fn s4_a05_rotation_preserves_first_login() {
+            let auth = checked(Auth::new(DatabasePort::new(1), &[], &NoHooks));
+            for legacy in [false, true] {
+                let mut session = session();
+                let original =
+                    checked(parse_timestamp(session["first_login_at"].as_str().unwrap()));
+                if legacy {
+                    session["first_login_at"] = Value::Null;
+                    session["last_renewed_at"] = Value::Null;
+                }
+                let (result, calls) = run(
+                    vec![
+                        ("query", rows(refresh())),
+                        ("begin", json!({"lease": 7})),
+                        ("exec", rows(session.clone())),
+                        ("exec", rows(refresh())),
+                        ("exec", rows(user())),
+                        ("exec", rows(refresh())),
+                        ("exec", rows(session)),
+                        ("exec", rows(refresh())),
+                        ("commit", json!({})),
+                    ],
+                    auth.refresh(&"A".repeat(43)),
+                );
+                let tokens = checked(result);
+                assert_eq!(tokens.session_id, SESSION_ID);
+                assert_eq!(tokens.user_id, USER_ID);
+                assert_eq!(
+                    tokens.refresh_expires_at,
+                    checked(timestamp_at(testing::NOW + 30 * DAY))
+                );
+                assert_eq!(
+                    checked(parse_timestamp(
+                        assignment(&calls[6], "first_login_at")
+                            .and_then(Value::as_str)
+                            .expect("rotation omitted first login")
+                    )),
+                    original,
+                    "rotation moved first login"
+                );
+                assert!(
+                    assignment(&calls[6], "last_renewed_at")
+                        == Some(&json!(checked(timestamp_at(testing::NOW))))
+                );
+                assert!(
+                    calls[7]["sql"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("insert into \"app_auth_refresh_tokens\"")
+                );
+                assert!(calls.last().unwrap()["op"] == "commit");
+            }
+        }
+
+        #[test]
+        fn s5_a06_a07_expired_family_rejects_live_access() {
+            for absolute in [0, 3_600] {
+                let auth = checked(
+                    checked(Auth::new(DatabasePort::new(1), &[], &NoHooks))
+                        .with_session_policy(3_600, absolute),
+                );
+                let mut session = session();
+                // The access credential is still live at the exact family deadline.
+                session["first_login_at"] = json!(checked(timestamp_at(testing::NOW - 3_600_000)));
+                session["last_renewed_at"] = json!(checked(timestamp_at(
+                    testing::NOW - if absolute == 0 { 3_600_000 } else { 600_000 }
+                )));
+                let (result, calls) = run(
+                    vec![
+                        ("query", rows(session.clone())),
+                        ("begin", json!({"lease": 7})),
+                        ("exec", rows(session.clone())),
+                        ("exec", rows(user())),
+                        ("exec", rows(session)),
+                        ("commit", json!({})),
+                    ],
+                    auth.session(&"A".repeat(43)),
+                );
+                let error = result.err().expect("expired family accepted live access");
+                assert_eq!((error.status, error.code.as_str()), (401, "invalid_token"));
+                assert_revoked_and_committed(&calls);
+            }
+        }
+
+        #[test]
+        fn s6_a05_consumed_refresh_after_old_expiry_revokes_family() {
+            let auth = checked(Auth::new(DatabasePort::new(1), &[], &NoHooks));
+            let mut refresh = refresh();
+            refresh["created_at"] = json!(checked(timestamp_at(testing::NOW - 3 * DAY)));
+            refresh["consumed_at"] = json!(checked(timestamp_at(testing::NOW - 2 * DAY)));
+            refresh["expires_at"] = json!(checked(timestamp_at(testing::NOW - DAY)));
+            let (result, calls) = run(
+                vec![
+                    ("query", rows(refresh.clone())),
+                    ("begin", json!({"lease": 7})),
+                    ("exec", rows(session())),
+                    ("exec", rows(refresh)),
+                    ("exec", rows(user())),
+                    ("exec", rows(session())),
+                    ("commit", json!({})),
+                ],
+                auth.refresh(&"A".repeat(43)),
+            );
+            let error = result.err().expect("consumed refresh accepted");
+            assert_eq!(
+                (error.status, error.code.as_str()),
+                (401, "session_revoked")
+            );
+            assert_revoked_and_committed(&calls);
+        }
+
+        #[test]
+        fn s7_a06_access_does_not_renew_family() {
+            let auth = checked(Auth::new(DatabasePort::new(1), &[], &NoHooks));
+            let (result, calls) = run(
+                vec![
+                    ("query", rows(session())),
+                    ("begin", json!({"lease": 7})),
+                    ("exec", rows(session())),
+                    ("exec", rows(user())),
+                    ("commit", json!({})),
+                ],
+                auth.session(&"A".repeat(43)),
+            );
+            let session = checked(result);
+            assert_eq!(session.id, SESSION_ID);
+            assert_eq!(session.user.id, USER_ID);
+            assert!(
+                calls
+                    .iter()
+                    .all(|call| assignment(call, "last_renewed_at").is_none()),
+                "access renewed family"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .all(|call| assignment(call, "first_login_at").is_none())
+            );
+            assert!(calls.last().unwrap()["op"] == "commit");
+        }
+    }
 
     fn checked<T>(result: Result<T, OperationError>) -> T {
         result.unwrap_or_else(|error| panic!("{}", error.code))

@@ -77,6 +77,7 @@ pub(crate) struct HostResponse {
     pub error: Option<String>,
 }
 
+#[cfg(not(all(test, not(target_arch = "wasm32"))))]
 pub(crate) async fn call(request: HostRequest<'_>) -> Result<HostResponse, String> {
     let payload = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
     let value = wasm_bindgen_futures::JsFuture::from(db(payload))
@@ -94,10 +95,62 @@ pub fn random_bytes(length: usize) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+#[cfg(not(all(test, not(target_arch = "wasm32"))))]
 fn format_host_rejection(error: crate::wasm_bindgen::JsValue) -> String {
     let text = error.as_string();
     match text {
         Some(message) => message,
         None => "the database host rejected the operation".to_string(),
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) async fn call(request: HostRequest<'_>) -> Result<HostResponse, String> {
+    let payload = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+    let response = testing::respond(serde_json::from_slice(&payload).unwrap());
+    serde_json::from_value(response).map_err(|error| error.to_string())
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) mod testing {
+    use serde_json::Value;
+    use std::{cell::RefCell, future::Future, task::Context};
+
+    pub(crate) const NOW: i64 = 60 * 86_400_000;
+    type Handler = Box<dyn FnMut(Value) -> Value>;
+
+    thread_local! {
+        static HANDLER: RefCell<Option<Handler>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn respond(request: Value) -> Value {
+        HANDLER.with_borrow_mut(|handler| {
+            handler.as_mut().expect("no scripted database host")(request)
+        })
+    }
+
+    pub(crate) fn run<T>(
+        handler: impl FnMut(Value) -> Value + 'static,
+        future: impl Future<Output = T>,
+    ) -> T {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                HANDLER.set(None);
+            }
+        }
+        HANDLER.with_borrow_mut(|current| {
+            assert!(current.is_none(), "nested scripted database host");
+            *current = Some(Box::new(handler));
+        });
+        let _reset = Reset;
+        let mut future = std::pin::pin!(future);
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(value) => value,
+            std::task::Poll::Pending => {
+                panic!("scripted database host must complete synchronously")
+            }
+        }
     }
 }
