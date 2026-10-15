@@ -266,6 +266,14 @@ fn error_envelope(status: u16, code: &str) -> ResponseEnvelope {
     }
 }
 
+fn is_credential_header(name: &str, auth_enabled: bool) -> bool {
+    name.eq_ignore_ascii_case("proxy-authorization")
+        || auth_enabled
+            && ["authorization", "cookie"]
+                .iter()
+                .any(|header| name.eq_ignore_ascii_case(header))
+}
+
 fn validate_application<A: Application>(application: &A) -> Result<(), &'static str> {
     use crate::auth::UserCreationHooks;
 
@@ -456,11 +464,7 @@ async fn serve_inner<A: Application>(
         }
     }
     let mut headers = parsed.headers;
-    if A::AUTH_ENABLED {
-        headers.retain(|(name, _)| {
-            !name.eq_ignore_ascii_case("authorization") && !name.eq_ignore_ascii_case("cookie")
-        });
-    }
+    headers.retain(|(name, _)| !is_credential_header(name, A::AUTH_ENABLED));
     let runtime = RuntimeContext {
         rid,
         method: parsed.method,
@@ -535,9 +539,13 @@ mod tests {
         serde_json::to_vec(&json!({
             "method": "POST", "path": format!("/{operation}"),
             "headers": [
+                ["pRoXy-AuThOrIzAtIoN", "proxy-credential"],
+                ["Proxy-Authorization", "proxy-credential-duplicate"],
                 ["Content-Type", "application/json"],
                 ["aUtHoRiZaTiOn", format!("Bearer {:043}", 1)],
+                ["Authorization", format!("Bearer {:043}", 2)],
                 ["cOoKiE", "custom=session"],
+                ["Cookie", "custom=session-duplicate"],
                 ["X-Request-Label", "visible"],
                 ["Origin", "https://app.example.test"],
             ],
@@ -629,14 +637,38 @@ mod tests {
     }
 
     #[test]
-    fn auth_disabled_preserves_credentials_with_and_without_database() {
+    fn auth_disabled_preserves_application_credentials_and_removes_proxy_credentials() {
         for response in [
             request(App::<false, true>, "probe.headers", true, vec![]),
             request(App::<false, false>, "probe.headers", false, vec![]),
         ] {
             assert_eq!(response.status, 200);
-            let metadata: Value = serde_json::from_slice(&metadata("probe.headers")).unwrap();
+            let mut metadata: Value = serde_json::from_slice(&metadata("probe.headers")).unwrap();
+            metadata["headers"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|header| {
+                    !header[0]
+                        .as_str()
+                        .unwrap()
+                        .eq_ignore_ascii_case("proxy-authorization")
+                });
             for key in ["headers", "request_headers"] {
+                assert_eq!(
+                    response.body[key]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|header| {
+                            header[0]
+                                .as_str()
+                                .unwrap()
+                                .eq_ignore_ascii_case("proxy-authorization")
+                        })
+                        .count(),
+                    0,
+                    "proxy credential header reached customer code"
+                );
                 assert!(
                     response.body[key] == metadata["headers"],
                     "credential headers changed"
@@ -667,14 +699,16 @@ mod tests {
         assert_eq!(response.body["authenticated"], true);
         for key in ["headers", "request_headers"] {
             let headers = response.body[key].as_array().unwrap();
-            assert!(
-                headers.iter().all(|header| {
-                    let name = header[0].as_str().unwrap();
-                    !name.eq_ignore_ascii_case("authorization")
-                        && !name.eq_ignore_ascii_case("cookie")
-                }),
-                "credential header reached customer code"
-            );
+            for name in ["authorization", "cookie", "proxy-authorization"] {
+                assert_eq!(
+                    headers
+                        .iter()
+                        .filter(|header| header[0].as_str().unwrap().eq_ignore_ascii_case(name))
+                        .count(),
+                    0,
+                    "credential header reached customer code"
+                );
+            }
             assert!(headers.iter().any(|header| header[0] == "X-Request-Label"));
         }
         let rejected = request(
