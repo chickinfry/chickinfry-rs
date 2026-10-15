@@ -315,25 +315,26 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                 let Some(session) = session else {
                     return Ok(None);
                 };
-                let legacy_refresh = if session.first_login_at.is_none() {
-                    tx.app_auth_refresh_tokens
-                        .find_many(FindMany {
-                            filter: Some(Filter::all(vec![
-                                Filter::eq(
-                                    tx.app_auth_refresh_tokens.columns().session_id,
-                                    json!(session.id),
-                                ),
-                                Filter::is_null(tx.app_auth_refresh_tokens.columns().consumed_at),
-                            ])),
-                            limit: Some(1),
-                            ..Default::default()
-                        })
-                        .await?
-                        .into_iter()
-                        .next()
-                } else {
-                    None
-                };
+                let latest_refresh = tx
+                    .app_auth_refresh_tokens
+                    .find_many(FindMany {
+                        filter: Some(Filter::all(vec![
+                            Filter::eq(
+                                tx.app_auth_refresh_tokens.columns().session_id,
+                                json!(session.id),
+                            ),
+                            Filter::is_null(tx.app_auth_refresh_tokens.columns().consumed_at),
+                        ])),
+                        order: vec![Order {
+                            column: tx.app_auth_refresh_tokens.columns().created_at,
+                            direction: Direction::Descending,
+                        }],
+                        limit: Some(1),
+                        ..Default::default()
+                    })
+                    .await?
+                    .into_iter()
+                    .next();
                 let user = tx
                     .app_auth_users
                     .find_by_id(AppAuthUsersPrimaryKey {
@@ -341,14 +342,16 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                     })
                     .await?;
                 let now = now_millis();
-                if self.session_policy.expired(
-                    now,
-                    session.first_login_at.as_deref(),
-                    &session.created_at,
-                    session.last_renewed_at.as_deref(),
-                    legacy_refresh.as_ref().map(|row| row.created_at.as_str()),
-                    legacy_refresh.as_ref().map(|row| row.expires_at.as_str()),
-                )? {
+                if (session.first_login_at.is_some() && latest_refresh.is_none())
+                    || self.session_policy.expired(
+                        now,
+                        session.first_login_at.as_deref(),
+                        &session.created_at,
+                        session.last_renewed_at.as_deref(),
+                        latest_refresh.as_ref().map(|row| row.created_at.as_str()),
+                        latest_refresh.as_ref().map(|row| row.expires_at.as_str()),
+                    )?
+                {
                     tx.app_auth_sessions
                         .update(
                             AppAuthSessionsPrimaryKey { id: session.id },
@@ -628,39 +631,38 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                         .await?;
                     let Some(session) = session else { continue };
                     if session.revoked_at.is_none() {
-                        let latest = if session.first_login_at.is_none() {
-                            tx.app_auth_refresh_tokens
-                                .find_many(FindMany {
-                                    filter: Some(Filter::all(vec![
-                                        Filter::eq(
-                                            tx.app_auth_refresh_tokens.columns().session_id,
-                                            json!(session.id),
-                                        ),
-                                        Filter::is_null(
-                                            tx.app_auth_refresh_tokens.columns().consumed_at,
-                                        ),
-                                    ])),
-                                    order: vec![Order {
-                                        column: tx.app_auth_refresh_tokens.columns().created_at,
-                                        direction: Direction::Descending,
-                                    }],
-                                    limit: Some(1),
-                                    ..Default::default()
-                                })
-                                .await?
-                                .into_iter()
-                                .next()
-                        } else {
-                            None
-                        };
-                        if !self.session_policy.expired(
-                            now,
-                            session.first_login_at.as_deref(),
-                            &session.created_at,
-                            session.last_renewed_at.as_deref(),
-                            latest.as_ref().map(|row| row.created_at.as_str()),
-                            latest.as_ref().map(|row| row.expires_at.as_str()),
-                        )? {
+                        let latest = tx
+                            .app_auth_refresh_tokens
+                            .find_many(FindMany {
+                                filter: Some(Filter::all(vec![
+                                    Filter::eq(
+                                        tx.app_auth_refresh_tokens.columns().session_id,
+                                        json!(session.id),
+                                    ),
+                                    Filter::is_null(
+                                        tx.app_auth_refresh_tokens.columns().consumed_at,
+                                    ),
+                                ])),
+                                order: vec![Order {
+                                    column: tx.app_auth_refresh_tokens.columns().created_at,
+                                    direction: Direction::Descending,
+                                }],
+                                limit: Some(1),
+                                ..Default::default()
+                            })
+                            .await?
+                            .into_iter()
+                            .next();
+                        if !(session.first_login_at.is_none() && latest.is_none())
+                            && !self.session_policy.expired(
+                                now,
+                                session.first_login_at.as_deref(),
+                                &session.created_at,
+                                session.last_renewed_at.as_deref(),
+                                latest.as_ref().map(|row| row.created_at.as_str()),
+                                latest.as_ref().map(|row| row.expires_at.as_str()),
+                            )?
+                        {
                             continue;
                         }
                         tx.app_auth_sessions
@@ -952,7 +954,7 @@ impl SessionPolicy {
         latest_refresh_created_at: Option<&str>,
         stored_expires_at: Option<&str>,
     ) -> Result<bool, OperationError> {
-        if first_login_at.is_none()
+        if (stored_expires_at.is_some() || first_login_at.is_none())
             && now >= parse_timestamp(stored_expires_at.ok_or_else(OperationError::internal)?)?
         {
             return Ok(true);
@@ -1301,6 +1303,16 @@ mod tests {
                     .find(|word| word.starts_with("app_auth_"))
                     .unwrap();
                 let rows = self.tables.entry(table.into()).or_default();
+                if sql.starts_with("insert ") {
+                    let columns = sql.split_once('(').unwrap().1.split_once(')').unwrap().0;
+                    let mut row =
+                        json!({"id": fixture_id(10_000 + rows.len()), "consumed_at": null});
+                    for (column, value) in columns.split(", ").zip(params) {
+                        row[column.trim_matches('"')] = value.clone();
+                    }
+                    rows.push(row.clone());
+                    return json!({"rows": [row]});
+                }
                 let filter = sql.split_once(" where ").map(|(_, tail)| {
                     tail.split(" order by ")
                         .next()
@@ -1498,6 +1510,22 @@ mod tests {
                     .with_session_policy(3_600, 0),
             );
             let mut host = CleanupHost::default();
+            for index in 0..2 {
+                let mut legacy = session();
+                legacy["id"] = json!(fixture_id(900 + index));
+                legacy["first_login_at"] = Value::Null;
+                legacy["last_renewed_at"] = Value::Null;
+                legacy["created_at"] = json!(checked(timestamp_at(testing::NOW - 8 * DAY)));
+                legacy["expires_at"] =
+                    json!(checked(timestamp_at(testing::NOW - 8 * DAY + 900_000)));
+                host.add("app_auth_sessions", legacy.clone());
+                if index == 1 {
+                    let mut consumed = refresh();
+                    consumed["session_id"] = legacy["id"].clone();
+                    consumed["consumed_at"] = json!(checked(timestamp_at(testing::NOW - 60_000)));
+                    host.add("app_auth_refresh_tokens", consumed);
+                }
+            }
             for index in 0..101 {
                 let mut legacy = session();
                 legacy["id"] = json!(fixture_id(index + 100));
@@ -1527,7 +1555,20 @@ mod tests {
                 auth.cleanup(),
             );
             let host = state.borrow();
-            assert_eq!(host.deleted, 2, "legacy dead family did not progress");
+            assert!(
+                host.calls.last().unwrap()["op"] == "commit",
+                "legacy gaps rolled back cleanup"
+            );
+            assert!(host.calls.iter().all(|call| call["op"] != "rollback"));
+            for index in 0..2 {
+                assert!(
+                    host.tables["app_auth_sessions"]
+                        .iter()
+                        .all(|row| row["id"] != fixture_id(900 + index)),
+                    "legacy family without an unconsumed refresh survived cleanup"
+                );
+            }
+            assert_eq!(host.deleted, 5, "legacy dead family did not progress");
             assert_eq!(host.tables["app_auth_sessions"].len(), 100);
             assert_eq!(host.tables["app_auth_refresh_tokens"].len(), 100);
             assert_eq!(
@@ -1537,7 +1578,7 @@ mod tests {
                         .as_str()
                         .is_some_and(|sql| sql.starts_with("update \"app_auth_sessions\"")))
                     .count(),
-                2,
+                6,
                 "live legacy families consumed candidates"
             );
         }
@@ -1612,11 +1653,11 @@ mod tests {
         }
 
         #[test]
-        fn f05_current_absolute_cap_uses_first_login_or_family_creation() {
-            for legacy in [false, true] {
+        fn f05_current_policy_uses_first_login_or_latest_renewal() {
+            for (legacy, absolute) in [(false, 0), (false, 3_600), (true, 0), (true, 3_600)] {
                 let auth = checked(
                     checked(Auth::new(DatabasePort::new(1), &[], &NoHooks))
-                        .with_session_policy(3_600, 3_600),
+                        .with_session_policy(3_600, absolute),
                 );
                 let mut host = CleanupHost::default();
                 let mut candidate = session();
@@ -1628,10 +1669,16 @@ mod tests {
                 candidate["last_renewed_at"] = if legacy {
                     Value::Null
                 } else {
-                    json!(checked(timestamp_at(testing::NOW - 60_000)))
+                    json!(checked(timestamp_at(
+                        testing::NOW - if absolute == 0 { 3_600_000 } else { 60_000 },
+                    )))
                 };
                 host.add("app_auth_sessions", candidate);
-                host.add("app_auth_refresh_tokens", refresh());
+                let mut credential = refresh();
+                credential["created_at"] = json!(checked(timestamp_at(
+                    testing::NOW - if absolute == 0 { 3_600_000 } else { 60_000 },
+                )));
+                host.add("app_auth_refresh_tokens", credential);
                 let state = Rc::new(RefCell::new(host));
                 let state_host = state.clone();
                 testing::run(
@@ -1728,6 +1775,7 @@ mod tests {
             let auth = checked(Auth::new(DatabasePort::new(1), &[], &NoHooks));
             for legacy in [false, true] {
                 let mut session = session();
+                session["expires_at"] = json!(checked(timestamp_at(testing::NOW - 1)));
                 let original =
                     checked(parse_timestamp(session["first_login_at"].as_str().unwrap()));
                 if legacy {
@@ -1792,32 +1840,149 @@ mod tests {
         }
 
         #[test]
-        fn s5_a06_a07_expired_family_rejects_live_access() {
-            for absolute in [0, 3_600] {
+        fn s5_a06_a07_unusable_family_rejects_live_access() {
+            for (absolute, missing_refresh) in [(0, false), (3_600, false), (0, true)] {
                 let auth = checked(
                     checked(Auth::new(DatabasePort::new(1), &[], &NoHooks))
                         .with_session_policy(3_600, absolute),
                 );
+                let mut host = CleanupHost::default();
                 let mut session = session();
-                // The access credential is still live at the exact family deadline.
+                session["token_hash"] = json!(token_digest(&"A".repeat(43)));
+                // The access credential remains live when the family must be rejected.
                 session["first_login_at"] = json!(checked(timestamp_at(testing::NOW - 3_600_000)));
                 session["last_renewed_at"] = json!(checked(timestamp_at(
-                    testing::NOW - if absolute == 0 { 3_600_000 } else { 600_000 }
+                    testing::NOW
+                        - if absolute == 0 && !missing_refresh {
+                            3_600_000
+                        } else {
+                            600_000
+                        }
                 )));
-                let (result, calls) = run(
-                    vec![
-                        ("query", rows(session.clone())),
-                        ("begin", json!({"lease": 7})),
-                        ("exec", rows(session.clone())),
-                        ("exec", rows(user())),
-                        ("exec", rows(session)),
-                        ("commit", json!({})),
-                    ],
+                host.add("app_auth_sessions", session);
+                if !missing_refresh {
+                    host.add("app_auth_refresh_tokens", refresh());
+                }
+                host.add("app_auth_users", user());
+                let state = Rc::new(RefCell::new(host));
+                let state_host = state.clone();
+                let result = testing::run(
+                    move |request| state_host.borrow_mut().respond(request),
                     auth.session(&"A".repeat(43)),
                 );
-                let error = result.err().expect("expired family accepted live access");
-                assert_eq!((error.status, error.code.as_str()), (401, "invalid_token"));
-                assert_revoked_and_committed(&calls);
+                assert_eq!(
+                    result
+                        .map(|_| ())
+                        .map_err(|error| (error.status, error.code)),
+                    Err((401, "invalid_token".into()))
+                );
+                assert_revoked_and_committed(&state.borrow().calls);
+            }
+
+            for absolute in [0, 7_200] {
+                let capped = checked(
+                    checked(Auth::new(DatabasePort::new(1), &[], &NoHooks))
+                        .with_session_policy(86_400, 3_600),
+                );
+                let expanded = checked(
+                    checked(Auth::new(DatabasePort::new(1), &[], &NoHooks))
+                        .with_session_policy(86_400, absolute),
+                );
+                let mut host = CleanupHost::default();
+                let mut session = session();
+                session["first_login_at"] = json!(checked(timestamp_at(testing::NOW - 3_540_000)));
+                session["created_at"] = session["first_login_at"].clone();
+                let mut credential = refresh();
+                credential["token_hash"] = json!(token_digest(&"A".repeat(43)));
+                host.add("app_auth_sessions", session);
+                host.add("app_auth_refresh_tokens", credential);
+                host.add("app_auth_users", user());
+                let state = Rc::new(RefCell::new(host));
+                let state_host = state.clone();
+                let tokens = checked(testing::run(
+                    move |request| state_host.borrow_mut().respond(request),
+                    capped.refresh(&"A".repeat(43)),
+                ));
+                assert_eq!(
+                    tokens.refresh_expires_at,
+                    checked(timestamp_at(testing::NOW + 60_000))
+                );
+                assert_eq!(
+                    tokens.expires_at,
+                    checked(timestamp_at(testing::NOW + 900_000))
+                );
+                {
+                    // Advance the stored timeline by two minutes against the fixed host clock.
+                    let mut host = state.borrow_mut();
+                    for table in ["app_auth_sessions", "app_auth_refresh_tokens"] {
+                        for row in host.tables.get_mut(table).unwrap() {
+                            for column in [
+                                "created_at",
+                                "first_login_at",
+                                "last_renewed_at",
+                                "expires_at",
+                                "consumed_at",
+                            ] {
+                                if let Some(value) = row[column].as_str() {
+                                    row[column] = json!(checked(timestamp_at(
+                                        checked(parse_timestamp(value)) - 120_000
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    host.calls.clear();
+                }
+                let state_host = state.clone();
+                let result = testing::run(
+                    move |request| state_host.borrow_mut().respond(request),
+                    expanded.session(&tokens.access_token),
+                );
+                assert_eq!(
+                    result
+                        .map(|_| ())
+                        .map_err(|error| (error.status, error.code)),
+                    Err((401, "invalid_token".into())),
+                    "policy expansion revived stored-expired access"
+                );
+                assert_revoked_and_committed(&state.borrow().calls);
+            }
+        }
+
+        #[test]
+        fn policy_changes_reject_stored_or_current_refresh_expiry() {
+            for (idle, stored_expired) in [(2_592_000, true), (3_600, false)] {
+                let auth = checked(
+                    checked(Auth::new(DatabasePort::new(1), &[], &NoHooks))
+                        .with_session_policy(idle, 0),
+                );
+                let mut session = session();
+                session["last_renewed_at"] = json!(checked(timestamp_at(testing::NOW - 7_200_000)));
+                let mut refresh = refresh();
+                refresh["created_at"] = session["last_renewed_at"].clone();
+                refresh["expires_at"] = json!(checked(timestamp_at(
+                    testing::NOW + if stored_expired { -3_600_000 } else { 30 * DAY },
+                )));
+                session["token_hash"] = json!(token_digest(&"A".repeat(43)));
+                refresh["token_hash"] = json!(token_digest(&"A".repeat(43)));
+                let mut host = CleanupHost::default();
+                host.add("app_auth_sessions", session);
+                host.add("app_auth_refresh_tokens", refresh);
+                host.add("app_auth_users", user());
+                let state = Rc::new(RefCell::new(host));
+                let state_host = state.clone();
+                let result = testing::run(
+                    move |request| state_host.borrow_mut().respond(request),
+                    auth.refresh(&"A".repeat(43)),
+                );
+                assert_eq!(
+                    result
+                        .map(|_| ())
+                        .map_err(|error| (error.status, error.code)),
+                    Err((401, "session_revoked".into())),
+                    "expired refresh returned the wrong result"
+                );
+                assert_revoked_and_committed(&state.borrow().calls);
             }
         }
 
@@ -1856,6 +2021,7 @@ mod tests {
                     ("query", rows(session())),
                     ("begin", json!({"lease": 7})),
                     ("exec", rows(session())),
+                    ("exec", rows(refresh())),
                     ("exec", rows(user())),
                     ("commit", json!({})),
                 ],
@@ -1887,6 +2053,7 @@ mod tests {
                     ("query", rows(session())),
                     ("begin", json!({"lease": 7})),
                     ("exec", rows(session())),
+                    ("exec", rows(refresh())),
                     ("exec", rows(user())),
                     ("commit", json!({})),
                     ("query", rows(session())),
@@ -1995,9 +2162,19 @@ mod tests {
     }
 
     #[test]
-    fn current_policy_expansion_ignores_old_deadlines_after_transition() {
+    fn current_policy_expansion_never_revives_stored_expiry() {
         let policy = checked(SessionPolicy::new(2_592_000, 0));
-        assert!(!is_expired(&policy, 8 * DAY, 0, 7 * DAY));
+        for (now, expired) in [(7 * DAY - 1, false), (7 * DAY, true), (8 * DAY, true)] {
+            assert_eq!(is_expired(&policy, now, 0, 7 * DAY), expired);
+        }
+        assert!(checked(policy.expired(
+            8 * DAY,
+            Some("invalid"),
+            "invalid",
+            Some("invalid"),
+            None,
+            Some(&checked(timestamp_at(7 * DAY))),
+        )));
         let first_login = checked(timestamp_at(DAY));
         assert!(!checked(policy.expired(
             30 * DAY,
