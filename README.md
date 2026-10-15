@@ -53,6 +53,25 @@ Refresh compares the original record before saving a successful response and
 preserves concurrent replacement or deletion. Custom stores must do the same,
 without holding a storage lock during network activity.
 
+## Server authentication
+
+Generated applications must explicitly implement `Application::AUTH_ENABLED`
+from the authentication declaration in `auth.yml`. This flag is independent of
+`REQUIRES_DATABASE`, which only requires a database binding. Regenerate existing
+applications with a CLI version that emits `AUTH_ENABLED` before upgrading.
+
+With authentication disabled, requests reach handlers without session lookup,
+`Authorization` and `Cookie` headers remain available, and undeclared `/auth.*`
+operations return `404 not_found`. Identity providers and authentication hooks
+require an authentication declaration; otherwise serving fails with
+`declare auth in auth.yml`.
+
+With authentication enabled, the runtime resolves sessions and handles built-in
+authentication operations. It removes `Authorization` and `Cookie` headers
+before building the customer context and request view. The `auth.session`
+response includes `expires_at` in RFC 3339 UTC format, bounded by both the stored
+refresh expiry and the current session policy.
+
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE).

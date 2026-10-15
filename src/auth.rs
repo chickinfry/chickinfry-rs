@@ -45,6 +45,10 @@ pub trait IdentityProvider {
 
 #[allow(async_fn_in_trait)]
 pub trait UserCreationHooks {
+    /// Whether customer hooks were registered; the runtime's NoHooks opts out.
+    fn is_registered(&self) -> bool {
+        true
+    }
     async fn creating(
         &self,
         _port: TransactionPort,
@@ -58,7 +62,11 @@ pub trait UserCreationHooks {
 }
 
 pub struct NoHooks;
-impl UserCreationHooks for NoHooks {}
+impl UserCreationHooks for NoHooks {
+    fn is_registered(&self) -> bool {
+        false
+    }
+}
 
 pub struct Auth<'a, H> {
     db: Database,
@@ -372,8 +380,27 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                 }) else {
                     return Ok(None);
                 };
+                let refresh = latest_refresh
+                    .as_ref()
+                    .ok_or_else(OperationError::internal)?;
+                let first_login_at = session
+                    .first_login_at
+                    .as_deref()
+                    .unwrap_or(&session.created_at);
+                let last_renewed_at = if session.first_login_at.is_none() {
+                    refresh.created_at.as_str()
+                } else {
+                    session.last_renewed_at.as_deref().unwrap_or(first_login_at)
+                };
+                let expires_at = self.session_policy.expires_at(
+                    parse_timestamp(first_login_at)?,
+                    parse_timestamp(last_renewed_at)?,
+                );
                 Ok(Some(Session {
                     id: session.id,
+                    expires_at: timestamp_at(
+                        expires_at.min(parse_timestamp(&refresh.expires_at)?),
+                    )?,
                     user: SessionUser {
                         id: user.id,
                         email: user.email,
