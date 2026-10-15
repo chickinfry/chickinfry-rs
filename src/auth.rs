@@ -881,10 +881,12 @@ fn normalize_email(value: &str) -> Result<String, OperationError> {
         return Err(OperationError::new("invalid_input", 400));
     }
     let parts: Vec<_> = email.split('@').collect();
-    let valid_domain = parts
-        .get(1)
-        .and_then(|domain| domain.rsplit_once('.'))
-        .is_some_and(|(head, tail)| !head.is_empty() && !tail.is_empty());
+    // Both sides of the JS pattern's domain separator also allow dots.
+    let valid_domain = parts.get(1).is_some_and(|domain| {
+        domain
+            .match_indices('.')
+            .any(|(index, _)| index > 0 && index + 1 < domain.len())
+    });
     if parts.len() != 2
         || parts[0].is_empty()
         || !valid_domain
