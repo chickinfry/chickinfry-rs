@@ -636,14 +636,41 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
             .transaction(async |tx| {
                 let mut remaining = 96;
                 let now = now_millis();
-                let candidates = tx
+                let start = cleanup_start()?;
+                let id = tx.app_auth_sessions.columns().id;
+                let mut candidates = tx
                     .app_auth_sessions
                     .find_many(FindMany {
-                        filter: Some(self.cleanup_candidates(tx, now)?),
+                        filter: Some(Filter::all(vec![
+                            self.cleanup_candidates(tx, now)?,
+                            Filter::ge(id, json!(start)),
+                        ])),
+                        order: vec![Order {
+                            column: id,
+                            direction: Direction::Ascending,
+                        }],
                         limit: Some(remaining),
                         ..Default::default()
                     })
                     .await?;
+                if candidates.len() < remaining as usize {
+                    candidates.extend(
+                        tx.app_auth_sessions
+                            .find_many(FindMany {
+                                filter: Some(Filter::all(vec![
+                                    self.cleanup_candidates(tx, now)?,
+                                    Filter::lt(id, json!(start)),
+                                ])),
+                                order: vec![Order {
+                                    column: id,
+                                    direction: Direction::Ascending,
+                                }],
+                                limit: Some(remaining - candidates.len() as u32),
+                                ..Default::default()
+                            })
+                            .await?,
+                    );
+                }
                 for candidate in candidates {
                     let session = tx
                         .app_auth_sessions
@@ -1069,6 +1096,31 @@ fn derive(password: &str, salt: &[u8]) -> Result<[u8; 32], OperationError> {
     Ok(key)
 }
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+std::thread_local! {
+    static CLEANUP_START: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+fn cleanup_start() -> Result<String, OperationError> {
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    if let Some(start) = CLEANUP_START.with_borrow(Clone::clone) {
+        return Ok(start);
+    }
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|_| OperationError::internal())?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = hex::encode(bytes);
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    ))
+}
+
 fn random_token() -> Result<String, OperationError> {
     crate::host::random_bytes(32)
         .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
@@ -1486,45 +1538,76 @@ mod tests {
                 );
             }
             let state_host = state.clone();
+            let rotated = checked(testing::run(
+                move |request| state_host.borrow_mut().respond(request),
+                auth.refresh(&"C".repeat(43)),
+            ));
+            let renewed = state.borrow().tables["app_auth_sessions"][0]["last_renewed_at"].clone();
+            let state_host = state.clone();
             let error = testing::run(
                 move |request| state_host.borrow_mut().respond(request),
                 auth.refresh(&"A".repeat(43)),
             )
             .err()
             .expect("reuse accepted");
-            assert_eq!(
-                error.code, "session_revoked",
-                "cleanup hid retained reuse credential"
-            );
-            let state_host = state.clone();
-            let error = testing::run(
-                move |request| state_host.borrow_mut().respond(request),
-                auth.session(&"B".repeat(43)),
-            )
-            .err()
-            .expect("revoked access accepted");
-            assert_eq!(error.code, "invalid_token");
-            let state_host = state.clone();
-            let error = testing::run(
-                move |request| state_host.borrow_mut().respond(request),
-                auth.refresh(&"C".repeat(43)),
-            )
-            .err()
-            .expect("revoked latest refresh accepted");
-            assert_eq!(error.code, "session_revoked");
+            assert_eq!(error.status, 401, "reuse was not rejected");
+            assert!(state.borrow().calls.last().unwrap()["op"] == "commit");
+            // Issuance maintenance may run after a competing reuse has revoked the family.
+            for pass in 0..=2 {
+                if pass > 0 {
+                    let state_host = state.clone();
+                    testing::run(
+                        move |request| state_host.borrow_mut().respond(request),
+                        auth.cleanup(),
+                    );
+                }
+                let retained = state.borrow().tables.clone();
+                assert!(
+                    retained["app_auth_sessions"]
+                        .iter()
+                        .all(|row| !row["revoked_at"].is_null()),
+                    "reuse left an active family"
+                );
+                for credential in [&"A".repeat(43), &"C".repeat(43), &rotated.refresh_token] {
+                    let state_host = state.clone();
+                    let error = testing::run(
+                        move |request| state_host.borrow_mut().respond(request),
+                        auth.refresh(credential),
+                    )
+                    .err()
+                    .expect("revoked refresh accepted");
+                    assert_eq!(error.status, 401);
+                }
+                for credential in [&"B".repeat(43), &rotated.access_token] {
+                    let state_host = state.clone();
+                    let error = testing::run(
+                        move |request| state_host.borrow_mut().respond(request),
+                        auth.session(credential),
+                    )
+                    .err()
+                    .expect("revoked access accepted");
+                    assert_eq!(error.status, 401);
+                }
+                let host = state.borrow();
+                assert!(
+                    host.tables == retained,
+                    "rejected credentials changed retained state"
+                );
+                assert!(
+                    host.tables["app_auth_sessions"]
+                        .iter()
+                        .all(|row| row["last_renewed_at"] == renewed)
+                );
+            }
+            assert!(state.borrow().tables["app_auth_sessions"].is_empty());
             let host = state.borrow();
-            assert!(!host.tables["app_auth_sessions"][0]["revoked_at"].is_null());
-            assert_eq!(
-                host.tables["app_auth_sessions"][0]["last_renewed_at"],
-                live["last_renewed_at"]
-            );
-            assert!(host.calls.last().unwrap()["op"] == "commit");
             assert!(
                 host.calls
                     .iter()
                     .filter(|call| call["sql"]
                         .as_str()
                         .is_some_and(|sql| sql.starts_with("update \"app_auth_sessions\"")))
+                    .filter(|call| assignment(call, "last_renewed_at").is_none())
                     .all(|call| assignment(call, "expires_at").is_none()),
                 "cleanup or revocation changed session expiry"
             );
@@ -1608,6 +1691,109 @@ mod tests {
                 6,
                 "live legacy families consumed candidates"
             );
+        }
+
+        fn with_cleanup_start<T>(start: &str, work: impl FnOnce() -> T) -> T {
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    CLEANUP_START.set(None);
+                }
+            }
+            CLEANUP_START.with_borrow_mut(|current| {
+                assert!(current.is_none(), "nested cleanup start override");
+                *current = Some(start.to_owned());
+            });
+            let _reset = Reset;
+            work()
+        }
+
+        fn assert_shrink_progress(wrap: bool, passes: usize) {
+            let auth = checked(
+                checked(Auth::new(DatabasePort::new(1), &[], &NoHooks))
+                    .with_session_policy(3_600, 0),
+            );
+            let mut host = CleanupHost::default();
+            for index in 0..=96 {
+                let dead = index == 96;
+                let id = if dead {
+                    if wrap {
+                        fixture_id(1)
+                    } else {
+                        "ffffffff-ffff-4fff-bfff-ffffffffffff".to_owned()
+                    }
+                } else if wrap {
+                    format!("fffffffe-ffff-4fff-bfff-{index:012}")
+                } else {
+                    fixture_id(index + 100)
+                };
+                let mut legacy = session();
+                legacy["id"] = json!(id);
+                legacy["first_login_at"] = Value::Null;
+                legacy["last_renewed_at"] = Value::Null;
+                legacy["created_at"] = json!(checked(timestamp_at(testing::NOW - 8 * DAY)));
+                legacy["expires_at"] =
+                    json!(checked(timestamp_at(testing::NOW - 8 * DAY + 900_000)));
+                host.add("app_auth_sessions", legacy);
+                let mut credential = refresh();
+                credential["id"] = json!(fixture_id(index + 300));
+                credential["session_id"] = json!(id);
+                credential["created_at"] = json!(checked(timestamp_at(
+                    testing::NOW - if dead { 2 * DAY } else { 1_800_000 }
+                )));
+                credential["expires_at"] = json!(checked(timestamp_at(
+                    testing::NOW + if dead { -DAY } else { DAY }
+                )));
+                host.add("app_auth_refresh_tokens", credential);
+            }
+            let state = Rc::new(RefCell::new(host));
+            for _ in 0..passes {
+                let state_host = state.clone();
+                testing::run(
+                    move |request| state_host.borrow_mut().respond(request),
+                    auth.cleanup(),
+                );
+                if state.borrow().tables["app_auth_sessions"].len() == 96 {
+                    break;
+                }
+            }
+            let host = state.borrow();
+            assert_eq!(
+                host.tables["app_auth_sessions"].len(),
+                96,
+                "live candidates starved the dead family"
+            );
+            assert_eq!(host.tables["app_auth_refresh_tokens"].len(), 96);
+            assert_eq!(host.deleted, 2, "cleanup changed a live family");
+            assert!(
+                host.tables["app_auth_sessions"]
+                    .iter()
+                    .all(|row| row["revoked_at"].is_null())
+            );
+            assert!(host.calls.iter().all(|call| call["op"] != "rollback"));
+        }
+
+        #[test]
+        fn f05_shrink_progress_from_random_start() {
+            with_cleanup_start("80000000-0000-4000-8000-000000000000", || {
+                assert_shrink_progress(false, 3)
+            });
+        }
+
+        #[test]
+        fn f05_shrink_progress_through_wrap() {
+            with_cleanup_start("ffffffff-ffff-4fff-bfff-ffffffffffff", || {
+                assert_shrink_progress(true, 3)
+            });
+        }
+
+        #[test]
+        fn f05_shrink_progress_with_real_generator() {
+            let start = checked(cleanup_start());
+            assert_eq!(start.len(), 36);
+            assert_eq!(&start[14..15], "4");
+            assert!(["8", "9", "a", "b"].contains(&&start[19..20]));
+            assert_shrink_progress(false, 8);
         }
 
         #[test]
@@ -1770,6 +1956,7 @@ mod tests {
                     ("begin", json!({"lease": 7})),
                     ("exec", json!({"rows": []})),
                     ("exec", json!({"rows": []})),
+                    ("exec", json!({"rows": []})),
                     ("commit", json!({})),
                 ],
                 auth.signin("user@example.test", password),
@@ -1821,6 +2008,7 @@ mod tests {
                         ("exec", rows(refresh())),
                         ("commit", json!({})),
                         ("begin", json!({"lease": 7})),
+                        ("exec", json!({"rows": []})),
                         ("exec", json!({"rows": []})),
                         ("exec", json!({"rows": []})),
                         ("commit", json!({})),
