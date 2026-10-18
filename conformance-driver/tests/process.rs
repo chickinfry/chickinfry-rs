@@ -185,10 +185,10 @@ fn auth_selector_calls_generated_methods_and_keeps_credentials_in_the_pipe() {
         "expires_at":"2099-01-01T00:00:00Z","refresh_expires_at":"2099-01-08T00:00:00Z",
         "user_id":"user","session_id":"session"})
     .to_string();
-    let mut replies = vec![common::response("HTTP/1.1 200 OK", &issued); 4];
+    let mut replies = vec![common::response("HTTP/1.1 200 OK", &issued); 3];
     replies.push(common::response(
         "HTTP/1.1 200 OK",
-        r#"{"id":"user","email":"hidden@example.invalid","session_id":"session"}"#,
+        r#"{"id":"user","email":"hidden@example.invalid","session_id":"session","expires_at":"2099-01-01T00:00:00Z"}"#,
     ));
     replies.push(common::response("HTTP/1.1 200 OK", r#"{"status":"ok"}"#));
     let (origin, requests) = common::serve(&replies);
@@ -197,7 +197,6 @@ fn auth_selector_calls_generated_methods_and_keeps_credentials_in_the_pipe() {
         ("refresh", refresh.as_str()),
         ("email", "hidden@example.invalid"),
         ("password", "private password canary"),
-        ("credential", "private identity credential canary"),
     ]
     .into_iter()
     .map(|(reference, value)| format!("{}\n", json!({"ref":reference,"value":value})))
@@ -216,6 +215,12 @@ fn auth_selector_calls_generated_methods_and_keeps_credentials_in_the_pipe() {
     assert_eq!(driver.next()["error"]["kind"], "unimplemented");
     driver.request("c:conflict", "client.call", json!({"clientRef":"auth","operation":"auth.refresh","input":{"refresh_token":null},"inputRefs":{"refresh_token":"refresh"}}));
     assert_eq!(driver.next()["error"]["code"], "invalid_args");
+    driver.request(
+        "c:unsupported-identity",
+        "client.call",
+        json!({"clientRef":"auth","operation":"auth.identity","input":{}}),
+    );
+    assert_eq!(driver.next()["error"]["code"], "unimplemented");
     for (index, (operation, input, refs)) in [
         (
             "auth.signup",
@@ -226,11 +231,6 @@ fn auth_selector_calls_generated_methods_and_keeps_credentials_in_the_pipe() {
             "auth.signin",
             json!({}),
             json!({"email":"email","password":"password"}),
-        ),
-        (
-            "auth.identity",
-            json!({"provider":"fixture"}),
-            json!({"credential":"credential"}),
         ),
         (
             "auth.refresh",
@@ -249,8 +249,12 @@ fn auth_selector_calls_generated_methods_and_keeps_credentials_in_the_pipe() {
             json!({"clientRef":"auth","operation":operation,"input":input,"inputRefs":refs}),
         );
         let response = driver.next();
-        assert!(response["error"].is_null());
-        if index < 4 {
+        assert!(
+            response["error"].is_null(),
+            "{operation}: {:?}",
+            response["error"]["code"]
+        );
+        if index < 3 {
             assert_eq!(
                 response["result"]["credentialRefs"],
                 json!({"access_token":"access","refresh_token":"refresh"})
@@ -266,18 +270,11 @@ fn auth_selector_calls_generated_methods_and_keeps_credentials_in_the_pipe() {
             assert!(actual["email"] == "hidden@example.invalid");
             assert!(actual["password"] == "private password canary");
         } else if index == 2 {
-            assert!(actual["credential"] == "private identity credential canary");
-        } else if index == 3 {
             assert!(actual["refresh_token"] == refresh);
         }
     }
     let output = String::from_utf8(driver.observed.clone()).unwrap();
-    for secret in [
-        access.as_str(),
-        refresh.as_str(),
-        "private password canary",
-        "private identity credential canary",
-    ] {
+    for secret in [access.as_str(), refresh.as_str(), "private password canary"] {
         assert!(!output.contains(secret));
     }
 }

@@ -375,7 +375,6 @@ impl<W: Write + Send + 'static> State<W> {
             (_, "probe.list") | (Fixture::Auth, "auth.session" | "auth.logout") => &[],
             (Fixture::Auth, "auth.refresh") => &["refresh_token"],
             (Fixture::Auth, "auth.signin" | "auth.signup") => &["email", "password"],
-            (Fixture::Auth, "auth.identity") => &["provider", "credential"],
             _ => return Err(Error::driver("unimplemented")),
         };
         let mut input = request
@@ -801,15 +800,6 @@ fn typed_call(
                             password: input["password"].as_str().expect("validated input").into(),
                         }))
                     }
-                    "auth.identity" => tokens!(
-                        client.auth.identity(&auth_sdk::client::AuthIdentityInput {
-                            provider: input["provider"].as_str().expect("validated input").into(),
-                            credential: input["credential"]
-                                .as_str()
-                                .expect("validated input")
-                                .into(),
-                        })
-                    ),
                     "auth.session" => {
                         let output = client
                             .auth

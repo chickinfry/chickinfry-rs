@@ -53,13 +53,13 @@ Standalone diagnostic launches may omit both arguments.
 
 ## Protocol and current limitations
 
-Execution specifications, suites and result rows use schema version 3; the
-process protocol remains version 1. The coordinator rejects version 2 inputs
-and evidence. Each `client.create` must provide `fixture: "plain"` or `"auth"`;
+Execution specifications, suites and result rows follow the coordinator's fixture
+revision; the process protocol remains version 1. The coordinator rejects version 2
+inputs and evidence. Each `client.create` must provide `fixture: "plain"` or `"auth"`;
 missing, unknown or mistyped selectors return `invalid_args`. Copies retain the
 source fixture. Both bridges call the corresponding generated typed SDK.
 The driver connects the fixture's probe operations and the auth fixture's
-signup, signin, identity, refresh, session and logout operations.
+signup, signin, refresh, session and logout operations.
 
 With SDKs and `conformance`, the handshake advertises `client.create`,
 `client.copy`, `client.call`, `session.store`, `barrier`, `session.trace` and
