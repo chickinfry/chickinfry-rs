@@ -629,7 +629,7 @@ mod tests {
                 json!({"rows": [{
                     "id": user_id, "email": "user@example.test", "session_version": 1,
                     "created_at": timestamp(-172_800_000),
-                    "disabled_at": null, "password_hash": null,
+                    "disabled_at": null, "email_verified_at": null, "password_hash": null,
                 }]}),
             ),
             ("commit", json!({})),

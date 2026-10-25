@@ -5,6 +5,148 @@ use chickinfry::orm::{Column, Connection, FindMany, Kind, Repository, TableDefin
 use chickinfry::server::OperationError;
 
 
+static APP_AUTH_ACTION_TOKENS_TABLE: TableDefinition = TableDefinition::new(
+    "app_auth_action_tokens",
+    &["id", ],
+    &[
+        Column::new("attempts", Kind::Integer, false, true, false, ""),
+        Column::new("consumed_at", Kind::Timestamp, true, true, false, ""),
+        Column::new("created_at", Kind::Timestamp, false, true, false, ""),
+        Column::new("expires_at", Kind::Timestamp, false, false, false, ""),
+        Column::new("id", Kind::Id, false, true, false, ""),
+        Column::new("kind", Kind::Text, false, false, false, ""),
+        Column::new("token_hash", Kind::Text, false, false, true, ""),
+        Column::new("user_id", Kind::Id, false, false, false, "app_auth_users.id"),
+    ],
+);
+
+#[derive(Debug, Clone, chickinfry::serde::Serialize, chickinfry::serde::Deserialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthActionTokensRow {
+    pub attempts: i32,
+    pub consumed_at: Option<String>,
+    pub created_at: String,
+    pub expires_at: String,
+    pub id: String,
+    pub kind: String,
+    pub token_hash: String,
+    pub user_id: String,
+}
+
+#[derive(Debug, chickinfry::serde::Serialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthActionTokensInsert {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consumed_at: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    pub expires_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub kind: String,
+    pub token_hash: String,
+    pub user_id: String,
+}
+
+/// The patch for one primary-key-addressed row. Primary-key columns are
+/// absent, so updates can never move a row identity.
+#[derive(Debug, Default, chickinfry::serde::Serialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthActionTokensUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consumed_at: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+}
+
+#[derive(Debug, chickinfry::serde::Deserialize, chickinfry::serde::Serialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthActionTokensPrimaryKey {
+    pub id: String,
+}
+
+pub struct AppAuthActionTokensRepository(chickinfry::orm::Repository);
+
+pub struct AppAuthActionTokensColumns {
+    pub attempts: Column,
+    pub consumed_at: Column,
+    pub created_at: Column,
+    pub expires_at: Column,
+    pub id: Column,
+    pub kind: Column,
+    pub token_hash: Column,
+    pub user_id: Column,
+}
+
+impl AppAuthActionTokensRepository {
+
+    pub fn columns(&self) -> AppAuthActionTokensColumns {
+        AppAuthActionTokensColumns {
+            attempts: Column::new("attempts", Kind::Integer, false, true, false, ""),
+            consumed_at: Column::new("consumed_at", Kind::Timestamp, true, true, false, ""),
+            created_at: Column::new("created_at", Kind::Timestamp, false, true, false, ""),
+            expires_at: Column::new("expires_at", Kind::Timestamp, false, false, false, ""),
+            id: Column::new("id", Kind::Id, false, true, false, ""),
+            kind: Column::new("kind", Kind::Text, false, false, false, ""),
+            token_hash: Column::new("token_hash", Kind::Text, false, false, true, ""),
+            user_id: Column::new("user_id", Kind::Id, false, false, false, "app_auth_users.id"),
+        }
+    }
+    pub(crate) fn new(repository: chickinfry::orm::Repository) -> Self {
+        Self(repository)
+    }
+
+    pub async fn insert(&self, insert: AppAuthActionTokensInsert) -> Result<AppAuthActionTokensRow, OperationError> {
+        let value = chickinfry::serde_json::to_value(&insert)
+            .map_err(|_| OperationError::internal())?;
+        self.0.insert(&value).await
+    }
+
+    pub async fn find_by_id(&self, key: AppAuthActionTokensPrimaryKey) -> Result<Option<AppAuthActionTokensRow>, OperationError> {
+        let value = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        self.0.find_by_id(&value).await
+    }
+
+    pub async fn find_many(&self, options: FindMany) -> Result<Vec<AppAuthActionTokensRow>, OperationError> {
+        self.0.find_many(options).await
+    }
+
+    pub async fn update(&self, key: AppAuthActionTokensPrimaryKey, patch: AppAuthActionTokensUpdate) -> Result<AppAuthActionTokensRow, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let patch = chickinfry::serde_json::to_value(&patch)
+            .map_err(|_| OperationError::internal())?;
+        self.0.update(&key, &patch).await
+    }
+
+    pub async fn update_if(&self, key: AppAuthActionTokensPrimaryKey, filter: chickinfry::orm::Filter, patch: AppAuthActionTokensUpdate) -> Result<Option<AppAuthActionTokensRow>, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let patch = chickinfry::serde_json::to_value(&patch)
+            .map_err(|_| OperationError::internal())?;
+        self.0.update_if(&key, &filter, &patch).await
+    }
+
+    pub async fn delete(&self, key: AppAuthActionTokensPrimaryKey) -> Result<bool, OperationError> {
+        let value = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        self.0.delete(&value).await
+    }
+}
+
 static APP_AUTH_IDENTITIES_TABLE: TableDefinition = TableDefinition::new(
     "app_auth_identities",
     &["provider", "subject", ],
@@ -259,6 +401,130 @@ impl AppAuthInvitesRepository {
     }
 
     pub async fn delete(&self, key: AppAuthInvitesPrimaryKey) -> Result<bool, OperationError> {
+        let value = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        self.0.delete(&value).await
+    }
+}
+
+static APP_AUTH_MIGRATIONS_TABLE: TableDefinition = TableDefinition::new(
+    "app_auth_migrations",
+    &["feature", "version", ],
+    &[
+        Column::new("applied_at", Kind::Timestamp, false, true, false, ""),
+        Column::new("digest", Kind::Text, false, false, false, ""),
+        Column::new("feature", Kind::Text, false, false, false, ""),
+        Column::new("name", Kind::Text, false, false, false, ""),
+        Column::new("phase", Kind::Text, false, false, false, ""),
+        Column::new("version", Kind::Integer, false, false, false, ""),
+    ],
+);
+
+#[derive(Debug, Clone, chickinfry::serde::Serialize, chickinfry::serde::Deserialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthMigrationsRow {
+    pub applied_at: String,
+    pub digest: String,
+    pub feature: String,
+    pub name: String,
+    pub phase: String,
+    pub version: i32,
+}
+
+#[derive(Debug, chickinfry::serde::Serialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthMigrationsInsert {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_at: Option<String>,
+    pub digest: String,
+    pub feature: String,
+    pub name: String,
+    pub phase: String,
+    pub version: i32,
+}
+
+/// The patch for one primary-key-addressed row. Primary-key columns are
+/// absent, so updates can never move a row identity.
+#[derive(Debug, Default, chickinfry::serde::Serialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthMigrationsUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+}
+
+#[derive(Debug, chickinfry::serde::Deserialize, chickinfry::serde::Serialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthMigrationsPrimaryKey {
+    pub feature: String,
+    pub version: i32,
+}
+
+pub struct AppAuthMigrationsRepository(chickinfry::orm::Repository);
+
+pub struct AppAuthMigrationsColumns {
+    pub applied_at: Column,
+    pub digest: Column,
+    pub feature: Column,
+    pub name: Column,
+    pub phase: Column,
+    pub version: Column,
+}
+
+impl AppAuthMigrationsRepository {
+
+    pub fn columns(&self) -> AppAuthMigrationsColumns {
+        AppAuthMigrationsColumns {
+            applied_at: Column::new("applied_at", Kind::Timestamp, false, true, false, ""),
+            digest: Column::new("digest", Kind::Text, false, false, false, ""),
+            feature: Column::new("feature", Kind::Text, false, false, false, ""),
+            name: Column::new("name", Kind::Text, false, false, false, ""),
+            phase: Column::new("phase", Kind::Text, false, false, false, ""),
+            version: Column::new("version", Kind::Integer, false, false, false, ""),
+        }
+    }
+    pub(crate) fn new(repository: chickinfry::orm::Repository) -> Self {
+        Self(repository)
+    }
+
+    pub async fn insert(&self, insert: AppAuthMigrationsInsert) -> Result<AppAuthMigrationsRow, OperationError> {
+        let value = chickinfry::serde_json::to_value(&insert)
+            .map_err(|_| OperationError::internal())?;
+        self.0.insert(&value).await
+    }
+
+    pub async fn find_by_id(&self, key: AppAuthMigrationsPrimaryKey) -> Result<Option<AppAuthMigrationsRow>, OperationError> {
+        let value = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        self.0.find_by_id(&value).await
+    }
+
+    pub async fn find_many(&self, options: FindMany) -> Result<Vec<AppAuthMigrationsRow>, OperationError> {
+        self.0.find_many(options).await
+    }
+
+    pub async fn update(&self, key: AppAuthMigrationsPrimaryKey, patch: AppAuthMigrationsUpdate) -> Result<AppAuthMigrationsRow, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let patch = chickinfry::serde_json::to_value(&patch)
+            .map_err(|_| OperationError::internal())?;
+        self.0.update(&key, &patch).await
+    }
+
+    pub async fn update_if(&self, key: AppAuthMigrationsPrimaryKey, filter: chickinfry::orm::Filter, patch: AppAuthMigrationsUpdate) -> Result<Option<AppAuthMigrationsRow>, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let patch = chickinfry::serde_json::to_value(&patch)
+            .map_err(|_| OperationError::internal())?;
+        self.0.update_if(&key, &filter, &patch).await
+    }
+
+    pub async fn delete(&self, key: AppAuthMigrationsPrimaryKey) -> Result<bool, OperationError> {
         let value = chickinfry::serde_json::to_value(&key)
             .map_err(|_| OperationError::internal())?;
         self.0.delete(&value).await
@@ -659,6 +925,163 @@ impl AppAuthSessionsRepository {
     }
 }
 
+static APP_AUTH_SIGNUP_REQUESTS_TABLE: TableDefinition = TableDefinition::new(
+    "app_auth_signup_requests",
+    &["id", ],
+    &[
+        Column::new("attempts", Kind::Integer, false, true, false, ""),
+        Column::new("code_expires_at", Kind::Timestamp, false, false, false, ""),
+        Column::new("code_hash", Kind::Text, false, false, false, ""),
+        Column::new("created_at", Kind::Timestamp, false, true, false, ""),
+        Column::new("email", Kind::Text, false, false, false, ""),
+        Column::new("expires_at", Kind::Timestamp, false, false, false, ""),
+        Column::new("id", Kind::Id, false, true, false, ""),
+        Column::new("invite_id", Kind::Id, true, true, false, "app_auth_invites.id"),
+        Column::new("password_hash", Kind::Text, false, false, false, ""),
+        Column::new("updated_at", Kind::Timestamp, false, true, false, ""),
+    ],
+);
+
+#[derive(Debug, Clone, chickinfry::serde::Serialize, chickinfry::serde::Deserialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthSignupRequestsRow {
+    pub attempts: i32,
+    pub code_expires_at: String,
+    pub code_hash: String,
+    pub created_at: String,
+    pub email: String,
+    pub expires_at: String,
+    pub id: String,
+    pub invite_id: Option<String>,
+    pub password_hash: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, chickinfry::serde::Serialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthSignupRequestsInsert {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<i32>,
+    pub code_expires_at: String,
+    pub code_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    pub email: String,
+    pub expires_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invite_id: Option<Option<String>>,
+    pub password_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+/// The patch for one primary-key-addressed row. Primary-key columns are
+/// absent, so updates can never move a row identity.
+#[derive(Debug, Default, chickinfry::serde::Serialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthSignupRequestsUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_expires_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invite_id: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, chickinfry::serde::Deserialize, chickinfry::serde::Serialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthSignupRequestsPrimaryKey {
+    pub id: String,
+}
+
+pub struct AppAuthSignupRequestsRepository(chickinfry::orm::Repository);
+
+pub struct AppAuthSignupRequestsColumns {
+    pub attempts: Column,
+    pub code_expires_at: Column,
+    pub code_hash: Column,
+    pub created_at: Column,
+    pub email: Column,
+    pub expires_at: Column,
+    pub id: Column,
+    pub invite_id: Column,
+    pub password_hash: Column,
+    pub updated_at: Column,
+}
+
+impl AppAuthSignupRequestsRepository {
+
+    pub fn columns(&self) -> AppAuthSignupRequestsColumns {
+        AppAuthSignupRequestsColumns {
+            attempts: Column::new("attempts", Kind::Integer, false, true, false, ""),
+            code_expires_at: Column::new("code_expires_at", Kind::Timestamp, false, false, false, ""),
+            code_hash: Column::new("code_hash", Kind::Text, false, false, false, ""),
+            created_at: Column::new("created_at", Kind::Timestamp, false, true, false, ""),
+            email: Column::new("email", Kind::Text, false, false, false, ""),
+            expires_at: Column::new("expires_at", Kind::Timestamp, false, false, false, ""),
+            id: Column::new("id", Kind::Id, false, true, false, ""),
+            invite_id: Column::new("invite_id", Kind::Id, true, true, false, "app_auth_invites.id"),
+            password_hash: Column::new("password_hash", Kind::Text, false, false, false, ""),
+            updated_at: Column::new("updated_at", Kind::Timestamp, false, true, false, ""),
+        }
+    }
+    pub(crate) fn new(repository: chickinfry::orm::Repository) -> Self {
+        Self(repository)
+    }
+
+    pub async fn insert(&self, insert: AppAuthSignupRequestsInsert) -> Result<AppAuthSignupRequestsRow, OperationError> {
+        let value = chickinfry::serde_json::to_value(&insert)
+            .map_err(|_| OperationError::internal())?;
+        self.0.insert(&value).await
+    }
+
+    pub async fn find_by_id(&self, key: AppAuthSignupRequestsPrimaryKey) -> Result<Option<AppAuthSignupRequestsRow>, OperationError> {
+        let value = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        self.0.find_by_id(&value).await
+    }
+
+    pub async fn find_many(&self, options: FindMany) -> Result<Vec<AppAuthSignupRequestsRow>, OperationError> {
+        self.0.find_many(options).await
+    }
+
+    pub async fn update(&self, key: AppAuthSignupRequestsPrimaryKey, patch: AppAuthSignupRequestsUpdate) -> Result<AppAuthSignupRequestsRow, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let patch = chickinfry::serde_json::to_value(&patch)
+            .map_err(|_| OperationError::internal())?;
+        self.0.update(&key, &patch).await
+    }
+
+    pub async fn update_if(&self, key: AppAuthSignupRequestsPrimaryKey, filter: chickinfry::orm::Filter, patch: AppAuthSignupRequestsUpdate) -> Result<Option<AppAuthSignupRequestsRow>, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let patch = chickinfry::serde_json::to_value(&patch)
+            .map_err(|_| OperationError::internal())?;
+        self.0.update_if(&key, &filter, &patch).await
+    }
+
+    pub async fn delete(&self, key: AppAuthSignupRequestsPrimaryKey) -> Result<bool, OperationError> {
+        let value = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        self.0.delete(&value).await
+    }
+}
+
 static APP_AUTH_USERS_TABLE: TableDefinition = TableDefinition::new(
     "app_auth_users",
     &["id", ],
@@ -666,6 +1089,7 @@ static APP_AUTH_USERS_TABLE: TableDefinition = TableDefinition::new(
         Column::new("created_at", Kind::Timestamp, false, true, false, ""),
         Column::new("disabled_at", Kind::Timestamp, true, true, false, ""),
         Column::new("email", Kind::Text, false, false, true, ""),
+        Column::new("email_verified_at", Kind::Timestamp, true, true, false, ""),
         Column::new("id", Kind::Id, false, true, false, ""),
         Column::new("password_hash", Kind::Text, true, true, false, ""),
         Column::new("session_version", Kind::Integer, false, true, false, ""),
@@ -678,6 +1102,7 @@ pub struct AppAuthUsersRow {
     pub created_at: String,
     pub disabled_at: Option<String>,
     pub email: String,
+    pub email_verified_at: Option<String>,
     pub id: String,
     pub password_hash: Option<String>,
     pub session_version: i32,
@@ -691,6 +1116,8 @@ pub struct AppAuthUsersInsert {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_at: Option<Option<String>>,
     pub email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email_verified_at: Option<Option<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -711,6 +1138,8 @@ pub struct AppAuthUsersUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub email_verified_at: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub password_hash: Option<Option<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_version: Option<i32>,
@@ -728,6 +1157,7 @@ pub struct AppAuthUsersColumns {
     pub created_at: Column,
     pub disabled_at: Column,
     pub email: Column,
+    pub email_verified_at: Column,
     pub id: Column,
     pub password_hash: Column,
     pub session_version: Column,
@@ -740,6 +1170,7 @@ impl AppAuthUsersRepository {
             created_at: Column::new("created_at", Kind::Timestamp, false, true, false, ""),
             disabled_at: Column::new("disabled_at", Kind::Timestamp, true, true, false, ""),
             email: Column::new("email", Kind::Text, false, false, true, ""),
+            email_verified_at: Column::new("email_verified_at", Kind::Timestamp, true, true, false, ""),
             id: Column::new("id", Kind::Id, false, true, false, ""),
             password_hash: Column::new("password_hash", Kind::Text, true, true, false, ""),
             session_version: Column::new("session_version", Kind::Integer, false, true, false, ""),
@@ -790,11 +1221,14 @@ impl AppAuthUsersRepository {
 
 pub struct Database {
     _port: chickinfry::database::DatabasePort,
+    pub app_auth_action_tokens: AppAuthActionTokensRepository,
     pub app_auth_identities: AppAuthIdentitiesRepository,
     pub app_auth_invites: AppAuthInvitesRepository,
+    pub app_auth_migrations: AppAuthMigrationsRepository,
     pub app_auth_rate_limits: AppAuthRateLimitsRepository,
     pub app_auth_refresh_tokens: AppAuthRefreshTokensRepository,
     pub app_auth_sessions: AppAuthSessionsRepository,
+    pub app_auth_signup_requests: AppAuthSignupRequestsRepository,
     pub app_auth_users: AppAuthUsersRepository,
 }
 
@@ -802,11 +1236,14 @@ impl Database {
     pub fn new(port: DatabasePort) -> Database {
         Database {
             _port: port,
+            app_auth_action_tokens: AppAuthActionTokensRepository::new(Repository::new(&APP_AUTH_ACTION_TOKENS_TABLE, port)),
             app_auth_identities: AppAuthIdentitiesRepository::new(Repository::new(&APP_AUTH_IDENTITIES_TABLE, port)),
             app_auth_invites: AppAuthInvitesRepository::new(Repository::new(&APP_AUTH_INVITES_TABLE, port)),
+            app_auth_migrations: AppAuthMigrationsRepository::new(Repository::new(&APP_AUTH_MIGRATIONS_TABLE, port)),
             app_auth_rate_limits: AppAuthRateLimitsRepository::new(Repository::new(&APP_AUTH_RATE_LIMITS_TABLE, port)),
             app_auth_refresh_tokens: AppAuthRefreshTokensRepository::new(Repository::new(&APP_AUTH_REFRESH_TOKENS_TABLE, port)),
             app_auth_sessions: AppAuthSessionsRepository::new(Repository::new(&APP_AUTH_SESSIONS_TABLE, port)),
+            app_auth_signup_requests: AppAuthSignupRequestsRepository::new(Repository::new(&APP_AUTH_SIGNUP_REQUESTS_TABLE, port)),
             app_auth_users: AppAuthUsersRepository::new(Repository::new(&APP_AUTH_USERS_TABLE, port)),
         }
     }
@@ -814,11 +1251,14 @@ impl Database {
     pub fn transaction_port(port: TransactionPort) -> TransactionDatabase {
         TransactionDatabase {
             _port: port,
+            app_auth_action_tokens: AppAuthActionTokensRepository::new(Repository::transactional(&APP_AUTH_ACTION_TOKENS_TABLE, Connection::Transactional(port))),
             app_auth_identities: AppAuthIdentitiesRepository::new(Repository::transactional(&APP_AUTH_IDENTITIES_TABLE, Connection::Transactional(port))),
             app_auth_invites: AppAuthInvitesRepository::new(Repository::transactional(&APP_AUTH_INVITES_TABLE, Connection::Transactional(port))),
+            app_auth_migrations: AppAuthMigrationsRepository::new(Repository::transactional(&APP_AUTH_MIGRATIONS_TABLE, Connection::Transactional(port))),
             app_auth_rate_limits: AppAuthRateLimitsRepository::new(Repository::transactional(&APP_AUTH_RATE_LIMITS_TABLE, Connection::Transactional(port))),
             app_auth_refresh_tokens: AppAuthRefreshTokensRepository::new(Repository::transactional(&APP_AUTH_REFRESH_TOKENS_TABLE, Connection::Transactional(port))),
             app_auth_sessions: AppAuthSessionsRepository::new(Repository::transactional(&APP_AUTH_SESSIONS_TABLE, Connection::Transactional(port))),
+            app_auth_signup_requests: AppAuthSignupRequestsRepository::new(Repository::transactional(&APP_AUTH_SIGNUP_REQUESTS_TABLE, Connection::Transactional(port))),
             app_auth_users: AppAuthUsersRepository::new(Repository::transactional(&APP_AUTH_USERS_TABLE, Connection::Transactional(port))),
         }
     }
@@ -833,11 +1273,14 @@ impl Database {
         let lease = TransactionPort::begin(self._port).await?;
         let mut database = TransactionDatabase {
             _port: lease,
+            app_auth_action_tokens: AppAuthActionTokensRepository::new(Repository::transactional(&APP_AUTH_ACTION_TOKENS_TABLE, Connection::Transactional(lease))),
             app_auth_identities: AppAuthIdentitiesRepository::new(Repository::transactional(&APP_AUTH_IDENTITIES_TABLE, Connection::Transactional(lease))),
             app_auth_invites: AppAuthInvitesRepository::new(Repository::transactional(&APP_AUTH_INVITES_TABLE, Connection::Transactional(lease))),
+            app_auth_migrations: AppAuthMigrationsRepository::new(Repository::transactional(&APP_AUTH_MIGRATIONS_TABLE, Connection::Transactional(lease))),
             app_auth_rate_limits: AppAuthRateLimitsRepository::new(Repository::transactional(&APP_AUTH_RATE_LIMITS_TABLE, Connection::Transactional(lease))),
             app_auth_refresh_tokens: AppAuthRefreshTokensRepository::new(Repository::transactional(&APP_AUTH_REFRESH_TOKENS_TABLE, Connection::Transactional(lease))),
             app_auth_sessions: AppAuthSessionsRepository::new(Repository::transactional(&APP_AUTH_SESSIONS_TABLE, Connection::Transactional(lease))),
+            app_auth_signup_requests: AppAuthSignupRequestsRepository::new(Repository::transactional(&APP_AUTH_SIGNUP_REQUESTS_TABLE, Connection::Transactional(lease))),
             app_auth_users: AppAuthUsersRepository::new(Repository::transactional(&APP_AUTH_USERS_TABLE, Connection::Transactional(lease))),
         };
         match work(&mut database).await {
@@ -855,11 +1298,14 @@ impl Database {
 
 pub struct TransactionDatabase {
     _port: TransactionPort,
+    pub app_auth_action_tokens: AppAuthActionTokensRepository,
     pub app_auth_identities: AppAuthIdentitiesRepository,
     pub app_auth_invites: AppAuthInvitesRepository,
+    pub app_auth_migrations: AppAuthMigrationsRepository,
     pub app_auth_rate_limits: AppAuthRateLimitsRepository,
     pub app_auth_refresh_tokens: AppAuthRefreshTokensRepository,
     pub app_auth_sessions: AppAuthSessionsRepository,
+    pub app_auth_signup_requests: AppAuthSignupRequestsRepository,
     pub app_auth_users: AppAuthUsersRepository,
 }
 

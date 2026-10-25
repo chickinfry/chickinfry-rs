@@ -129,6 +129,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                         id: None,
                         created_at: None,
                         disabled_at: None,
+                        email_verified_at: None,
                         session_version: None,
                     })
                     .await?;
@@ -236,6 +237,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                                 id: None,
                                 created_at: None,
                                 disabled_at: None,
+                                email_verified_at: None,
                                 session_version: None,
                             })
                             .await?;
@@ -1217,7 +1219,7 @@ mod tests {
             json!({
                 "id": USER_ID, "email": "user@example.test", "session_version": 1,
                 "created_at": checked(timestamp_at(0)),
-                "disabled_at": null, "password_hash": null
+                "disabled_at": null, "email_verified_at": null, "password_hash": null
             })
         }
 
