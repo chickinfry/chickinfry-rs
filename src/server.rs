@@ -392,6 +392,24 @@ async fn serve_inner<A: Application>(
         Ok(value) if value.is_object() => value,
         _ => return Ok(error_envelope(400, "invalid_input")),
     };
+    let mut pending = vec![(&input, 1)];
+    while let Some((value, depth)) = pending.pop() {
+        if !value.is_object() && !value.is_array() {
+            continue;
+        }
+        if depth > 64 {
+            return Ok(error_envelope(400, "invalid_input"));
+        }
+        match value {
+            serde_json::Value::Object(object) => {
+                pending.extend(object.values().map(|value| (value, depth + 1)));
+            }
+            serde_json::Value::Array(array) => {
+                pending.extend(array.iter().map(|value| (value, depth + 1)));
+            }
+            _ => unreachable!(),
+        }
+    }
     let authorization = parsed
         .headers
         .iter()
@@ -491,7 +509,11 @@ mod tests {
     use super::*;
     use crate::{auth, host::testing};
     use serde_json::{Value, json};
-    use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        collections::VecDeque,
+        rc::Rc,
+    };
 
     struct Context {
         headers: Vec<(String, String)>,
@@ -533,6 +555,153 @@ mod tests {
                 "authenticated": context.session.is_some(),
             }))
         }
+    }
+
+    struct InputApp<const AUTH: bool>(Cell<usize>);
+
+    impl<const AUTH: bool> Application for InputApp<AUTH> {
+        type Context = Context;
+        const AUTH_ENABLED: bool = AUTH;
+        const EMAIL_PASSWORD_ENABLED: bool = AUTH;
+        const REQUIRES_DATABASE: bool = false;
+
+        fn accepts(&self, _operation: &str) -> bool {
+            true
+        }
+
+        fn auth_hooks(&self) -> impl auth::UserCreationHooks {
+            assert!(!AUTH, "invalid input reached authentication");
+            auth::NoHooks
+        }
+
+        async fn invoke(
+            &self,
+            _context: &Context,
+            _operation: &str,
+            _input: Value,
+        ) -> Result<Value, DispatchError> {
+            self.0.set(self.0.get() + 1);
+            Ok(json!({"ok": true}))
+        }
+    }
+
+    fn input_request<const AUTH: bool>(
+        application: &InputApp<AUTH>,
+        operation: &str,
+        body: String,
+    ) -> ResponseEnvelope {
+        testing::run(
+            |_| panic!("invalid input reached the host"),
+            serve_inner(
+                application,
+                serde_json::to_vec(&json!({
+                    "method": "POST", "path": format!("/{operation}"),
+                    "headers": [["Content-Type", "application/json"]],
+                }))
+                .unwrap(),
+                body.into_bytes(),
+                &crate::RuntimeConfig::default(),
+            ),
+        )
+        .unwrap()
+    }
+
+    fn nested_input(depth: usize, leaf: &str, in_list: bool) -> String {
+        let arrays = depth - if in_list { 3 } else { 1 };
+        let value = format!("{}{}{}", "[".repeat(arrays), leaf, "]".repeat(arrays));
+        if in_list {
+            format!(
+                r#"{{"required_name":"required","nullable_name":null,"entries":[],"large_rows":[{{"payload":"present","ignored":{value}}}]}}"#
+            )
+        } else {
+            format!(r#"{{"name":"structure","note":"ok","ignored":{value}}}"#)
+        }
+    }
+
+    #[test]
+    fn input_structure_limits() {
+        for (name, operation, body, status, calls) in [
+            (
+                "unknown-depth-65",
+                "catalog.create",
+                nested_input(65, "null", false),
+                400,
+                0,
+            ),
+            (
+                "unknown-depth-64",
+                "catalog.create",
+                nested_input(64, "null", false),
+                200,
+                1,
+            ),
+            (
+                "declared-list-depth-64",
+                "catalog.inspect_optional",
+                nested_input(64, "null", true),
+                200,
+                1,
+            ),
+            (
+                "unknown-positive-overflow",
+                "catalog.create",
+                nested_input(1, "1e999", false),
+                400,
+                0,
+            ),
+            (
+                "nested-negative-overflow",
+                "catalog.inspect_optional",
+                nested_input(3, "-1e999", true),
+                400,
+                0,
+            ),
+            (
+                "unknown-finite-double",
+                "catalog.create",
+                nested_input(1, "1e308", false),
+                200,
+                1,
+            ),
+            (
+                "reject-before-serialization",
+                "catalog.inspect_optional",
+                nested_input(20000, "null", false),
+                400,
+                0,
+            ),
+        ] {
+            let application = InputApp::<false>(Cell::new(0));
+            let response = input_request(&application, operation, body);
+            eprintln!(
+                "{name}: status={}, handler_calls={}",
+                response.status,
+                application.0.get()
+            );
+            assert_eq!(
+                (response.status, application.0.get()),
+                (status, calls),
+                "{name}"
+            );
+            assert_eq!(
+                response.body,
+                if status == 400 {
+                    json!({"error": "invalid_input"})
+                } else {
+                    json!({"ok": true})
+                },
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_auth_rejects_deep_input_before_authentication() {
+        let application = InputApp::<true>(Cell::new(0));
+        let response = input_request(&application, "auth.signup", nested_input(65, "null", false));
+        assert_eq!(response.status, 400);
+        assert_eq!(response.body, json!({"error": "invalid_input"}));
+        assert_eq!(application.0.get(), 0);
     }
 
     fn metadata(operation: &str) -> Vec<u8> {
