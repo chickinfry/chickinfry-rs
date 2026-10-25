@@ -7,6 +7,8 @@ use crate::database::DatabasePort;
 use crate::wasm_bindgen;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod json;
+
 /// Maximum accepted request body size, shared with the generated SDK limits.
 pub const REQUEST_BODY_LIMIT: usize = 4 << 20;
 
@@ -390,6 +392,7 @@ async fn serve_inner<A: Application>(
     }
     let input: serde_json::Value = match serde_json::from_slice::<serde_json::Value>(&body) {
         Ok(value) if value.is_object() => value,
+        Err(_) if !json::is_valid(&body) => return Ok(error_envelope(400, "invalid_json")),
         _ => return Ok(error_envelope(400, "invalid_input")),
     };
     let mut pending = vec![(&input, 1)];
@@ -588,7 +591,7 @@ mod tests {
     fn input_request<const AUTH: bool>(
         application: &InputApp<AUTH>,
         operation: &str,
-        body: String,
+        body: impl Into<Vec<u8>>,
     ) -> ResponseEnvelope {
         testing::run(
             |_| panic!("invalid input reached the host"),
@@ -599,7 +602,7 @@ mod tests {
                     "headers": [["Content-Type", "application/json"]],
                 }))
                 .unwrap(),
-                body.into_bytes(),
+                body.into(),
                 &crate::RuntimeConfig::default(),
             ),
         )
@@ -696,11 +699,85 @@ mod tests {
     }
 
     #[test]
+    fn input_json_errors_precede_structure_limits() {
+        for (name, body, code) in [
+            ("unclosed-object", b"{".to_vec(), "invalid_json"),
+            (
+                "unclosed-arrays",
+                "[".repeat(65).into_bytes(),
+                "invalid_json",
+            ),
+            (
+                "invalid-token-after-arrays",
+                format!("{}?", "[".repeat(65)).into_bytes(),
+                "invalid_json",
+            ),
+            (
+                "malformed-unclosed-depth-65",
+                format!(r#"{{"name":"structure","note":{}}}"#, "[".repeat(65)).into_bytes(),
+                "invalid_json",
+            ),
+            (
+                "malformed-token-after-depth-65",
+                format!(
+                    r#"{{"name":"structure","note":{}null{}!}}"#,
+                    "[".repeat(65),
+                    "]".repeat(65)
+                )
+                .into_bytes(),
+                "invalid_json",
+            ),
+            (
+                "syntax-after-recursion-limit",
+                nested_input(129, "?", false).into_bytes(),
+                "invalid_json",
+            ),
+            (
+                "valid-after-recursion-limit",
+                nested_input(129, "null", false).into_bytes(),
+                "invalid_input",
+            ),
+            (
+                "number-overflow",
+                b"{\"ignored\":1e999}".to_vec(),
+                "invalid_input",
+            ),
+            (
+                "syntax-after-overflow",
+                b"{\"ignored\":1e999,}".to_vec(),
+                "invalid_json",
+            ),
+            (
+                "invalid-utf8",
+                b"{\"name\":\"\xff\"}".to_vec(),
+                "invalid_json",
+            ),
+            ("non-object", b"[]".to_vec(), "invalid_input"),
+        ] {
+            let application = InputApp::<false>(Cell::new(0));
+            let response = input_request(&application, "catalog.create", body);
+            eprintln!(
+                "{name}: status={}, body={}, handler_calls={}",
+                response.status,
+                response.body,
+                application.0.get()
+            );
+            assert_eq!(response.status, 400, "{name}");
+            assert_eq!(response.body, json!({"error": code}), "{name}");
+            assert_eq!(application.0.get(), 0, "{name}");
+        }
+    }
+
+    #[test]
     fn builtin_auth_rejects_deep_input_before_authentication() {
         let application = InputApp::<true>(Cell::new(0));
         let response = input_request(&application, "auth.signup", nested_input(65, "null", false));
         assert_eq!(response.status, 400);
         assert_eq!(response.body, json!({"error": "invalid_input"}));
+        assert_eq!(application.0.get(), 0);
+        let response = input_request(&application, "auth.signup", "{");
+        assert_eq!(response.status, 400);
+        assert_eq!(response.body, json!({"error": "invalid_json"}));
         assert_eq!(application.0.get(), 0);
     }
 
