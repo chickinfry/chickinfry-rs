@@ -53,6 +53,25 @@ Refresh compares the original record before saving a successful response and
 preserves concurrent replacement or deletion. Custom stores must do the same,
 without holding a storage lock during network activity.
 
+## Device persistence
+
+The device adapter stores authentication state in files readable only by the
+current user: new directories use 0700 and files use 0600 on Unix; existing
+directories must be owned by the current user and not writable by others.
+Windows uses a current-user ACL. The files are not encrypted and do not use an OS keychain.
+
+`Client::with_persist(Persist::Disabled)` selects process memory, and
+`Client::with_persist(Persist::Dir(path))` selects a state directory. Relative paths are resolved once when the setting
+is attached, so later changes to the working directory do not move stored state.
+Empty paths are rejected.
+Omitting the setting selects the platform state location. Explicit bearer
+credentials and custom `with_session` stores bypass device persistence.
+
+The adapter is internal. Generated app/project ownership bindings and the
+signup-attempt lifecycle are not connected yet; this release does not restore
+a generated client's authentication automatically. Request-level credentials
+are never copied into the device files.
+
 ## Server authentication
 
 Generated applications must explicitly implement `Application::AUTH_ENABLED`

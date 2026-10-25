@@ -11,10 +11,31 @@ use std::fmt;
 use std::io::Read;
 use std::net::Ipv4Addr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::Weak;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+
+#[allow(
+    dead_code,
+    reason = "Generated ownership bindings are supplied separately."
+)]
+#[path = "device.rs"]
+pub(crate) mod device;
+
+/// Selects persistence for a generated client's device state.
+///
+/// Omitting this setting selects the platform default. Native
+/// device state uses owner-only files without encryption at rest.
+/// Windows restricts access to the current user with an ACL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Persist {
+    /// Keeps device state in this process only.
+    Disabled,
+    /// Uses an owner-only directory, resolving relative paths at attachment time.
+    Dir(PathBuf),
+}
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -64,7 +85,24 @@ pub enum ClientError {
 impl fmt::Display for ClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ClientError::Protocol(message) => write!(formatter, "{message}"),
+            ClientError::Protocol(message) => {
+                let description = match message.as_str() {
+                    "device_storage_unavailable" => {
+                        "Could not use device storage for the session. Check that the storage location is writable, or set persist to another directory or turn it off."
+                    }
+                    "device_storage_corrupt" => {
+                        "Stored session data could not be read. Sign out to clear it, then sign in again."
+                    }
+                    "device_storage_full" => {
+                        "Device storage for sign-in is full. Finish or cancel pending sign-ups, then try again."
+                    }
+                    "device_storage_version_unsupported" => {
+                        "Stored session data was written by a newer SDK. Update the SDK, or sign out and sign in again."
+                    }
+                    _ => message,
+                };
+                write!(formatter, "{description}")
+            }
             ClientError::Operation(error) => write!(formatter, "{error}"),
         }
     }
@@ -97,9 +135,9 @@ impl fmt::Debug for SessionCredentials {
     }
 }
 
-/// Caller-owned session credential storage. The SDK never writes credentials
-/// to disk itself; implementations decide where sessions persist and declare
-/// the one origin the client may ever send their credentials to.
+/// Caller-owned session credential storage. Implementations decide where
+/// sessions persist and declare the one origin credentials may be sent to.
+/// Built-in device persistence uses a separate fallible internal path.
 pub trait SessionStore: Send + Sync + 'static {
     /// Returns the deployment origin these credentials are bound to. There is
     /// no default: a store that cannot name its origin cannot be attached.
@@ -217,6 +255,8 @@ pub struct Client {
     origin: String,
     bearer: Option<String>,
     session: Option<Arc<dyn SessionStore>>,
+    persist: Option<Persist>,
+    device: Arc<Mutex<Option<Arc<device::Device>>>>,
 }
 
 impl Client {
@@ -248,6 +288,8 @@ impl Client {
             origin,
             bearer: None,
             session: None,
+            persist: None,
+            device: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -264,6 +306,8 @@ impl Client {
         let mut copy = self.clone();
         copy.bearer = Some(token.to_owned());
         copy.session = None;
+        copy.persist = Some(Persist::Disabled);
+        copy.device = Arc::new(Mutex::new(None));
         Ok(copy)
     }
 
@@ -275,7 +319,78 @@ impl Client {
         let mut copy = self.clone();
         copy.bearer = Some(credentials.access_token);
         copy.session = Some(store);
+        copy.persist = Some(Persist::Disabled);
+        copy.device = Arc::new(Mutex::new(None));
         Ok(copy)
+    }
+
+    /// Returns a copy with the selected device persistence policy.
+    /// Device preparation waits for trusted generated ownership bindings.
+    pub fn with_persist(&self, persist: Persist) -> Result<Self, ClientError> {
+        let persist = match persist {
+            Persist::Dir(path) => {
+                if path.as_os_str().is_empty() {
+                    return Err(device::error("unavailable"));
+                }
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    std::env::current_dir()
+                        .map_err(|_| device::error("unavailable"))?
+                        .join(path)
+                };
+                device::validate_path(&path)?;
+                Persist::Dir(path)
+            }
+            Persist::Disabled => Persist::Disabled,
+        };
+        let mut copy = self.clone();
+        if copy.session.take().is_some() {
+            copy.bearer = None;
+        }
+        copy.persist = Some(persist);
+        copy.device = Arc::new(Mutex::new(None));
+        Ok(copy)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Generated ownership bindings are supplied separately."
+    )]
+    pub(crate) fn device_store(
+        &self,
+        scope: device::Scope,
+    ) -> Result<Option<Arc<device::Device>>, ClientError> {
+        self.device_store_with(scope, device::Device::open)
+    }
+
+    fn device_store_with(
+        &self,
+        scope: device::Scope,
+        open: impl FnOnce(&std::path::Path, device::Scope) -> Result<device::Device, ClientError>,
+    ) -> Result<Option<Arc<device::Device>>, ClientError> {
+        if self.bearer.is_some() || self.session.is_some() {
+            return Ok(None);
+        }
+        if scope.origin != self.origin {
+            return Err(device::error("corrupt"));
+        }
+        let Some(path) = scope.path(self.persist.as_ref())? else {
+            return Ok(None);
+        };
+        let mut current = self
+            .device
+            .lock()
+            .map_err(|_| device::error("unavailable"))?;
+        if let Some(store) = current.as_ref() {
+            if store.scope != scope {
+                return Err(device::error("corrupt"));
+            }
+            return Ok(Some(store.clone()));
+        }
+        let store = Arc::new(open(&path, scope)?);
+        *current = Some(store.clone());
+        Ok(Some(store))
     }
 
     /// Invokes one declared operation and returns the JSON response value.
@@ -810,3 +925,7 @@ fn valid_error_code(code: &str) -> bool {
             .bytes()
             .all(|byte| byte == b'_' || byte.is_ascii_lowercase())
 }
+
+#[cfg(test)]
+#[path = "device/tests.rs"]
+mod device_tests;
