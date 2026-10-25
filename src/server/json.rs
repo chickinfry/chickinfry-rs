@@ -1,3 +1,73 @@
+use serde::{Deserialize, Deserializer, de};
+use serde_json::{Map, Value};
+use std::fmt;
+
+pub(super) struct Input(pub Value);
+
+impl<'de> Deserialize<'de> for Input {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct InputVisitor;
+
+        impl<'de> de::Visitor<'de> for InputVisitor {
+            type Value = Input;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a JSON value without duplicate object keys")
+            }
+
+            fn visit_bool<E: de::Error>(self, value: bool) -> Result<Input, E> {
+                Ok(Input(Value::Bool(value)))
+            }
+
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Input, E> {
+                Ok(Input(Value::Number(value.into())))
+            }
+
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Input, E> {
+                Ok(Input(Value::Number(value.into())))
+            }
+
+            fn visit_f64<E: de::Error>(self, value: f64) -> Result<Input, E> {
+                serde_json::Number::from_f64(value)
+                    .map(|number| Input(Value::Number(number)))
+                    .ok_or_else(|| E::custom("non-finite number"))
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Input, E> {
+                self.visit_string(value.to_owned())
+            }
+
+            fn visit_string<E: de::Error>(self, value: String) -> Result<Input, E> {
+                Ok(Input(Value::String(value)))
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<Input, E> {
+                Ok(Input(Value::Null))
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(self, mut access: A) -> Result<Input, A::Error> {
+                let mut values = Vec::new();
+                while let Some(Input(value)) = access.next_element()? {
+                    values.push(value);
+                }
+                Ok(Input(Value::Array(values)))
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, mut access: A) -> Result<Input, A::Error> {
+                let mut values = Map::new();
+                while let Some((key, Input(value))) = access.next_entry::<String, Input>()? {
+                    if values.insert(key, value).is_some() {
+                        return Err(de::Error::custom("duplicate object key"));
+                    }
+                }
+                Ok(Input(Value::Object(values)))
+            }
+        }
+
+        deserializer.deserialize_any(InputVisitor)
+    }
+}
+
 // serde_json can stop at a depth or numeric limit before reaching a syntax error.
 // Check the complete grammar without constructing values or recursing.
 pub(super) fn is_valid(mut input: &[u8]) -> bool {

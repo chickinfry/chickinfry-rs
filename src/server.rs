@@ -390,8 +390,8 @@ async fn serve_inner<A: Application>(
     if A::REQUIRES_DATABASE && config.database_url.is_none() {
         return Ok(error_envelope(503, "service_unavailable"));
     }
-    let input: serde_json::Value = match serde_json::from_slice::<serde_json::Value>(&body) {
-        Ok(value) if value.is_object() => value,
+    let input = match serde_json::from_slice::<json::Input>(&body) {
+        Ok(json::Input(value)) if value.is_object() => value,
         Err(_) if !json::is_valid(&body) => return Ok(error_envelope(400, "invalid_json")),
         _ => return Ok(error_envelope(400, "invalid_input")),
     };
@@ -625,6 +625,101 @@ mod tests {
     fn input_structure_limits() {
         for (name, operation, body, status, calls) in [
             (
+                "duplicate-key",
+                "catalog.create",
+                r#"{"name":"first","name":"second"}"#.to_string(),
+                400,
+                0,
+            ),
+            (
+                "nested-duplicate-key",
+                "catalog.create",
+                nested_input(63, r#"{"na\u006de":0,"name":1}"#, false),
+                400,
+                0,
+            ),
+            (
+                "escaped-duplicate-key",
+                "catalog.create",
+                r#"{"a":1,"\u0061":2}"#.to_string(),
+                400,
+                0,
+            ),
+            (
+                "overwritten-overflow",
+                "catalog.create",
+                r#"{"ignored":1e999,"ignored":0}"#.to_string(),
+                400,
+                0,
+            ),
+            (
+                "overwritten-deep-value",
+                "catalog.create",
+                format!(
+                    r#"{{"ignored":{}null{},"ignored":0}}"#,
+                    "[".repeat(20000),
+                    "]".repeat(20000)
+                ),
+                400,
+                0,
+            ),
+            (
+                "overflowing-long-integer",
+                "catalog.create",
+                format!(r#"{{"ignored":{}}}"#, "9".repeat(309)),
+                400,
+                0,
+            ),
+            (
+                "overflowing-5000-digit-integer",
+                "catalog.create",
+                format!(r#"{{"ignored":{}}}"#, "1".repeat(5000)),
+                400,
+                0,
+            ),
+            (
+                "finite-300-digit-integer",
+                "catalog.create",
+                format!(r#"{{"ignored":{}}}"#, "1".repeat(300)),
+                200,
+                1,
+            ),
+            (
+                "finite-long-integer",
+                "catalog.create",
+                format!(r#"{{"ignored":{}}}"#, "9".repeat(308)),
+                200,
+                1,
+            ),
+            (
+                "finite-long-decimal",
+                "catalog.create",
+                format!(r#"{{"ignored":0.{}}}"#, "9".repeat(400)),
+                200,
+                1,
+            ),
+            (
+                "unpaired-surrogate",
+                "catalog.create",
+                r#"{"ignored":"\uD800"}"#.to_string(),
+                400,
+                0,
+            ),
+            (
+                "unpaired-surrogate-key",
+                "catalog.create",
+                r#"{"ignored":{"\uDC00":0}}"#.to_string(),
+                400,
+                0,
+            ),
+            (
+                "distinct-objects-and-values",
+                "catalog.create",
+                r#"{"a":[{"name":"a\"}:[{\\x"},{"name":"b"}],"flags":[true,false],"b":"\uD834\uDD1E","c":-1,"d":18446744073709551615,"e":null,"f":1.25,"g":{}}"#.to_string(),
+                200,
+                1,
+            ),
+            (
                 "unknown-depth-65",
                 "catalog.create",
                 nested_input(65, "null", false),
@@ -677,8 +772,9 @@ mod tests {
             let application = InputApp::<false>(Cell::new(0));
             let response = input_request(&application, operation, body);
             eprintln!(
-                "{name}: status={}, handler_calls={}",
+                "{name}: status={}, body={}, handler_calls={}",
                 response.status,
+                response.body,
                 application.0.get()
             );
             assert_eq!(
@@ -701,6 +797,11 @@ mod tests {
     #[test]
     fn input_json_errors_precede_structure_limits() {
         for (name, body, code) in [
+            (
+                "syntax-after-duplicate-key",
+                br#"{"a":1,"a":2,}"#.to_vec(),
+                "invalid_json",
+            ),
             ("unclosed-object", b"{".to_vec(), "invalid_json"),
             (
                 "unclosed-arrays",
@@ -769,9 +870,17 @@ mod tests {
     }
 
     #[test]
-    fn builtin_auth_rejects_deep_input_before_authentication() {
+    fn builtin_auth_rejects_invalid_input_before_authentication() {
         let application = InputApp::<true>(Cell::new(0));
         let response = input_request(&application, "auth.signup", nested_input(65, "null", false));
+        assert_eq!(response.status, 400);
+        assert_eq!(response.body, json!({"error": "invalid_input"}));
+        assert_eq!(application.0.get(), 0);
+        let response = input_request(
+            &application,
+            "auth.signup",
+            r#"{"email":"first@example.test","email":"second@example.test","password":"unused"}"#,
+        );
         assert_eq!(response.status, 400);
         assert_eq!(response.body, json!({"error": "invalid_input"}));
         assert_eq!(application.0.get(), 0);
