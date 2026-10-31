@@ -84,7 +84,7 @@ all seven fields checked against the declared origin and credential references.
 `session.store.create` also accepts an origin-bound empty store when all three
 record/access/refresh references are absent; partial reference groups are invalid.
 The driver delegates storage and atomic expected-credential clearing to the
-runtime's public `MemorySessionStore`. It adds only revision and trace records
+runtime's public `MemoryStore`. It adds only revision and trace records
 around the runtime store operations; the trace records each actual invocation with `expectedAccessRef`, `expectedRefreshRef` and `removed`.
 The driver does not make an extra clear call when the runtime declines deletion.
 `input`/`inputRefs` conflicts are rejected even when the literal is null.

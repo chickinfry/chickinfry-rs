@@ -72,6 +72,7 @@ dependencies = [
  "getrandom",
  "hex",
  "js-sys",
+ "libc",
  "scrypt",
  "serde",
  "serde_json",

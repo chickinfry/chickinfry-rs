@@ -142,7 +142,7 @@ fn malformed_control_and_credential_pipes_never_expose_raw_values() {
     );
     let response = driver.next();
     assert_eq!(response["error"]["kind"], "sdk");
-    assert!(response["error"]["code"].is_null());
+    assert_eq!(response["error"]["code"], "invalid_argument");
     writeln!(driver.input.as_mut().unwrap(), "{{\"{}\":", secret).unwrap();
     driver.input.as_mut().unwrap().flush().unwrap();
     assert!(!driver.child.wait().unwrap().success());
@@ -680,15 +680,21 @@ fn diagnostic_sdk_errors_preserve_codes_status_and_transport_uncertainty() {
     }
     for (id, client, code, status, unknown) in [
         ("conflict", "client", json!("conflict"), json!(409), false),
+        ("corrupt", "client", json!("internal"), json!(200), false),
         (
-            "corrupt",
+            "disconnected",
             "client",
-            json!("invalid_response"),
-            json!(200),
+            json!("unavailable"),
+            Value::Null,
+            true,
+        ),
+        (
+            "refused",
+            "refused",
+            json!("unavailable"),
+            Value::Null,
             false,
         ),
-        ("disconnected", "client", Value::Null, Value::Null, true),
-        ("refused", "refused", Value::Null, Value::Null, false),
     ] {
         driver.request(
             &format!("c:{id}"),

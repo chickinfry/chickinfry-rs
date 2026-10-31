@@ -4,8 +4,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 #[cfg(test)]
-#[path = "../../tests/common/mod.rs"]
-mod common;
+use crate::common;
 
 /// Observed transitions; credential values remain inside the test process.
 #[derive(Clone)]
@@ -205,7 +204,7 @@ fn receiving_preserves_standard_read_sizes_capacity_and_bytes() {
 #[cfg(test)]
 #[test]
 fn memory_session_comparison_and_deletion_exclude_concurrent_writes() {
-    use super::{MemorySessionStore, SessionCredentials};
+    use super::{MemoryStore, SessionCredentials};
     use std::sync::mpsc;
     use std::time::Duration;
     let record = |value: &str| SessionCredentials {
@@ -218,7 +217,7 @@ fn memory_session_comparison_and_deletion_exclude_concurrent_writes() {
     };
     let old = record("P");
     let new = record("Q");
-    let store = Arc::new(MemorySessionStore::new("http://127.0.0.1:9", Some(old.clone())).unwrap());
+    let store = Arc::new(MemoryStore::new("http://127.0.0.1:9", Some(old.clone())).unwrap());
     let (entered, writing) = mpsc::channel();
     let (finished, written) = mpsc::channel();
     let writer = Arc::new(std::sync::Mutex::new(None));
@@ -275,7 +274,7 @@ fn memory_session_comparison_and_deletion_exclude_concurrent_writes() {
 #[cfg(test)]
 #[test]
 fn delayed_successful_refresh_preserves_concurrent_login_or_deletion() {
-    use super::{Client, MemorySessionStore, SessionCredentials};
+    use super::{HttpTransport, MemoryStore, SessionCredentials};
     use std::sync::{Mutex, mpsc};
     use std::time::Duration;
     let record = |access: &str, refresh: &str| SessionCredentials {
@@ -317,8 +316,8 @@ fn delayed_successful_refresh_preserves_concurrent_login_or_deletion() {
                 }
             },
         );
-        let store = Arc::new(MemorySessionStore::new(&origin, Some(old.clone())).unwrap());
-        let client = Client::with_timeout(&origin, Duration::from_secs(5))
+        let store = Arc::new(MemoryStore::new(&origin, Some(old.clone())).unwrap());
+        let client = HttpTransport::new(&origin, Some(Duration::from_secs(5)))
             .unwrap()
             .with_session(store.clone())
             .unwrap();

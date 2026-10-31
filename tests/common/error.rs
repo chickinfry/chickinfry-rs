@@ -1,9 +1,9 @@
 /// Checks public error formatting without printing unsafe actual values.
-pub fn assert_safe_protocol(error: &impl std::error::Error, expected: &str) {
+pub fn assert_safe_protocol(error: &crate::client::ClientError, expected: &str) {
     assert!(error.to_string() == expected, "unsafe Display message");
     assert!(
-        format!("{error:?}") == format!("Protocol({expected:?})"),
+        error.message == expected && error.operation_error.is_none(),
         "unsafe Debug message"
     );
-    assert!(error.source().is_none());
+    assert!(std::error::Error::source(error).is_none());
 }

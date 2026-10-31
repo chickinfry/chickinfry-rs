@@ -160,7 +160,7 @@ impl Filter {
             value,
         }
     }
-    pub fn le(column: Column, value: serde_json::Value) -> Filter {
+    pub fn lte(column: Column, value: serde_json::Value) -> Filter {
         Filter::Comparison {
             column,
             operator: Operator::LessEqual,
@@ -174,7 +174,7 @@ impl Filter {
             value,
         }
     }
-    pub fn ge(column: Column, value: serde_json::Value) -> Filter {
+    pub fn gte(column: Column, value: serde_json::Value) -> Filter {
         Filter::Comparison {
             column,
             operator: Operator::GreaterEqual,
@@ -196,12 +196,16 @@ impl Filter {
     pub fn is_in(column: Column, values: Vec<serde_json::Value>) -> Filter {
         Filter::In { column, values }
     }
-    pub fn all(filters: Vec<Filter>) -> Filter {
+    pub fn and(filters: Vec<Filter>) -> Filter {
         Filter::And(filters)
     }
-    pub fn any(filters: Vec<Filter>) -> Filter {
+    pub fn or(filters: Vec<Filter>) -> Filter {
         Filter::Or(filters)
     }
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "The shared ORM contract uses this associated constructor."
+    )]
     pub fn not(filter: Filter) -> Filter {
         Filter::Not(Box::new(filter))
     }
@@ -221,8 +225,8 @@ pub struct Order {
 
 #[derive(Default)]
 pub struct FindMany {
-    pub filter: Option<Filter>,
-    pub order: Vec<Order>,
+    pub r#where: Option<Filter>,
+    pub order_by: Vec<Order>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
 }
@@ -273,6 +277,21 @@ impl Repository {
         &self,
         insert: &serde_json::Value,
     ) -> Result<R, OperationError> {
+        self.insert_row(insert, false).await
+    }
+
+    pub async fn upsert<R: serde::de::DeserializeOwned>(
+        &self,
+        insert: &serde_json::Value,
+    ) -> Result<R, OperationError> {
+        self.insert_row(insert, true).await
+    }
+
+    async fn insert_row<R: serde::de::DeserializeOwned>(
+        &self,
+        insert: &serde_json::Value,
+        upsert: bool,
+    ) -> Result<R, OperationError> {
         let entries = insert.as_object().ok_or_else(OperationError::internal)?;
         let mut names = Vec::new();
         let mut params = Vec::new();
@@ -289,13 +308,46 @@ impl Repository {
             .map(|name| quote(name))
             .collect::<Result<_, _>>()?;
         let placeholders: Vec<String> = (1..=names.len()).map(placeholder).collect();
-        let sql = format!(
-            "insert into {} ({}) values ({}) returning {}",
-            quote(self.table.name)?,
-            quoted.join(", "),
-            placeholders.join(", "),
-            self.table.select_list()?
-        );
+        let mut sql = if names.is_empty() {
+            format!("insert into {} default values", quote(self.table.name)?)
+        } else {
+            format!(
+                "insert into {} ({}) values ({})",
+                quote(self.table.name)?,
+                quoted.join(", "),
+                placeholders.join(", ")
+            )
+        };
+        if upsert {
+            if self
+                .table
+                .primary_key
+                .iter()
+                .any(|name| !entries.contains_key(*name))
+            {
+                return Err(OperationError::internal());
+            }
+            let assignments = names
+                .iter()
+                .filter(|name| !self.table.primary_key.contains(name))
+                .map(|name| quote(name).map(|name| format!("{name} = excluded.{name}")))
+                .collect::<Result<Vec<_>, _>>()?;
+            if assignments.is_empty() {
+                return Err(OperationError::internal());
+            }
+            let primary = self
+                .table
+                .primary_key
+                .iter()
+                .map(|name| quote(name))
+                .collect::<Result<Vec<_>, _>>()?;
+            sql.push_str(&format!(
+                " on conflict ({}) do update set {}",
+                primary.join(", "),
+                assignments.join(", ")
+            ));
+        }
+        sql.push_str(&format!(" returning {}", self.table.select_list()?));
         self.one(&sql, &params).await
     }
 
@@ -323,14 +375,14 @@ impl Repository {
             self.table.select_list()?,
             quote(self.table.name)?
         );
-        if let Some(filter) = options.filter {
+        if let Some(filter) = options.r#where {
             let where_clause = compile_filter(&filter, &mut params)?;
             sql.push_str(" where ");
             sql.push_str(&where_clause);
         }
-        if !options.order.is_empty() {
+        if !options.order_by.is_empty() {
             let terms = options
-                .order
+                .order_by
                 .iter()
                 .map(|order| {
                     let name = order.column.database_name;
@@ -367,7 +419,7 @@ impl Repository {
     ) -> Result<R, OperationError> {
         self.update_optional(key, None, patch)
             .await?
-            .ok_or_else(OperationError::internal)
+            .ok_or_else(|| OperationError::new("not_found", 404))
     }
 
     pub async fn update_if<R: serde::de::DeserializeOwned>(
@@ -385,14 +437,68 @@ impl Repository {
         filter: Option<&Filter>,
         patch: &serde_json::Value,
     ) -> Result<Option<R>, OperationError> {
-        let entries = patch.as_object().ok_or_else(OperationError::internal)?;
-        if entries.is_empty() {
+        self.update_matching(key, filter, &serde_json::json!({}), patch)
+            .await
+    }
+
+    pub async fn increment<R: serde::de::DeserializeOwned>(
+        &self,
+        key: &serde_json::Value,
+        columns: &serde_json::Value,
+    ) -> Result<R, OperationError> {
+        if columns.as_object().is_none_or(|columns| columns.is_empty()) {
             return Err(OperationError::internal());
         }
+        self.update_matching(key, None, columns, &serde_json::json!({}))
+            .await?
+            .ok_or_else(|| OperationError::new("not_found", 404))
+    }
+
+    pub async fn increment_if<R: serde::de::DeserializeOwned>(
+        &self,
+        key: &serde_json::Value,
+        condition: &Filter,
+        columns: &serde_json::Value,
+        patch: &serde_json::Value,
+    ) -> Result<Option<R>, OperationError> {
+        if columns.as_object().is_none_or(|columns| columns.is_empty())
+            || patch.as_object().is_none_or(|patch| patch.is_empty())
+        {
+            return Err(OperationError::internal());
+        }
+        self.update_matching(key, Some(condition), columns, patch)
+            .await
+    }
+
+    async fn update_matching<R: serde::de::DeserializeOwned>(
+        &self,
+        key: &serde_json::Value,
+        filter: Option<&Filter>,
+        columns: &serde_json::Value,
+        patch: &serde_json::Value,
+    ) -> Result<Option<R>, OperationError> {
+        let entries = patch.as_object().ok_or_else(OperationError::internal)?;
+        let increments = columns.as_object().ok_or_else(OperationError::internal)?;
         let primary_keys: std::collections::BTreeSet<&str> =
             self.table.primary_key.iter().copied().collect();
         let mut assignments = Vec::new();
         let mut params = Vec::new();
+        for (name, amount) in increments {
+            let column = self
+                .table
+                .column(name)
+                .ok_or_else(OperationError::internal)?;
+            if primary_keys.contains(name.as_str())
+                || column.kind != Kind::Integer
+                || amount.as_i64().is_none_or(|amount| amount == 0)
+                || entries.contains_key(name)
+            {
+                return Err(OperationError::internal());
+            }
+            encode_value(column, amount, &mut params)?;
+            let name = quote(name)?;
+            assignments.push(format!("{name} = {name} + {}", placeholder(params.len())));
+        }
         for (name, value) in entries {
             if primary_keys.contains(name.as_str()) {
                 return Err(OperationError::internal());
@@ -403,6 +509,9 @@ impl Repository {
                 .ok_or_else(OperationError::internal)?;
             encode_value(column, value, &mut params)?;
             assignments.push(format!("{} = {}", quote(name)?, placeholder(params.len())));
+        }
+        if assignments.is_empty() {
+            return Err(OperationError::internal());
         }
         let (mut where_clause, mut key_params) = self.primary_key_filter(key, params.len())?;
         params.append(&mut key_params);
@@ -525,6 +634,7 @@ fn compile_filter(
             operator,
             value,
         } => {
+            filter_value(value).map_err(|_| OperationError::internal())?;
             encode_value(column, value, params)?;
             Ok(format!(
                 "{} {} {}",
@@ -539,6 +649,7 @@ fn compile_filter(
             }
             let mut placeholders = Vec::with_capacity(values.len());
             for value in values {
+                filter_value(value).map_err(|_| OperationError::internal())?;
                 encode_value(column, value, params)?;
                 placeholders.push(placeholder(params.len()));
             }
@@ -563,6 +674,16 @@ fn compile_filter(
             let compiled = compile_filter(inner, params)?;
             Ok(format!("not ({})", compiled))
         }
+    }
+}
+
+const NULL_FILTER_ERROR: &str = "Filter values cannot be null; use is_null or is_not_null.";
+
+fn filter_value(value: &serde_json::Value) -> Result<(), &'static str> {
+    if value.is_null() {
+        Err(NULL_FILTER_ERROR)
+    } else {
+        Ok(())
     }
 }
 
@@ -657,5 +778,136 @@ pub fn quote(name: &str) -> Result<String, OperationError> {
         Ok(format!("\"{}\"", name.replace('"', "\"\"")))
     } else {
         Err(OperationError::internal())
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use crate::host::testing;
+    use serde_json::{Value, json};
+
+    static TABLE: TableDefinition = TableDefinition::new(
+        "records",
+        &["id"],
+        &[
+            Column::new("id", Kind::Integer, false, false, false, ""),
+            Column::new("count", Kind::Integer, true, true, false, ""),
+            Column::new("name", Kind::Text, false, false, false, ""),
+        ],
+    );
+
+    #[test]
+    fn null_comparisons_require_null_predicates() {
+        let column = TABLE.columns[1];
+        for filter in [
+            Filter::eq(column, Value::Null),
+            Filter::ne(column, Value::Null),
+            Filter::is_in(column, vec![json!(1), Value::Null]),
+        ] {
+            let error = compile_filter(&filter, &mut Vec::new()).expect_err("null comparison");
+            assert_eq!(error.code, "operation_failed");
+            assert_eq!(error.status, 500);
+        }
+        assert!(compile_filter(&Filter::is_null(column), &mut Vec::new()).is_ok());
+    }
+
+    #[test]
+    fn missing_update_returns_not_found() {
+        let repository = Repository::new(&TABLE, DatabasePort::new(1));
+        let error = testing::run(
+            |_| json!({"rows": []}),
+            repository.update::<Value>(&json!({"id": 1}), &json!({"name": "missing"})),
+        )
+        .expect_err("missing update");
+        assert_eq!(error.code, "not_found");
+        assert_eq!(error.status, 404);
+        let error = testing::run(
+            |_| json!({"rows": []}),
+            repository.increment::<Value>(&json!({"id": 1}), &json!({"count": 1})),
+        )
+        .expect_err("missing increment");
+        assert_eq!(error.code, "not_found");
+        assert_eq!(error.status, 404);
+        let row = testing::run(
+            |_| json!({"rows": []}),
+            repository.increment_if::<Value>(
+                &json!({"id": 1}),
+                &Filter::eq(TABLE.columns[1], json!(2)),
+                &json!({"count": 1}),
+                &json!({"name": "changed"}),
+            ),
+        );
+        assert!(matches!(row, Ok(None)));
+    }
+
+    #[test]
+    fn upsert_and_conditional_increment_bind_values_atomically() {
+        let repository = Repository::new(&TABLE, DatabasePort::new(1));
+        let row = json!({"id": 1, "count": 3, "name": "changed"});
+        for (upsert, expected_sql, expected_params) in [
+            (
+                true,
+                "insert into \"records\" (\"count\", \"id\", \"name\") values ($1, $2, $3) on conflict (\"id\") do update set \"count\" = excluded.\"count\", \"name\" = excluded.\"name\" returning \"id\", \"count\", \"name\"",
+                json!([3, 1, "changed"]),
+            ),
+            (
+                false,
+                "update \"records\" set \"count\" = \"count\" + $1, \"name\" = $2 where \"id\" = $3 and (\"count\" = $4) returning \"id\", \"count\", \"name\"",
+                json!([1, "changed", 1, 2]),
+            ),
+        ] {
+            let output = row.clone();
+            let result = testing::run(
+                move |request| {
+                    assert_eq!(request["sql"], expected_sql);
+                    assert_eq!(request["params"], expected_params);
+                    json!({"rows": [output]})
+                },
+                async {
+                    if upsert {
+                        repository.upsert::<Value>(&row).await.map(Some)
+                    } else {
+                        repository
+                            .increment_if::<Value>(
+                                &json!({"id": 1}),
+                                &Filter::eq(TABLE.columns[1], json!(2)),
+                                &json!({"count": 1}),
+                                &json!({"name": "changed"}),
+                            )
+                            .await
+                    }
+                },
+            );
+            assert!(matches!(result, Ok(Some(value)) if value == row));
+        }
+        for (amounts, patch) in [
+            (json!({"count": 0}), json!({"name": "changed"})),
+            (json!({"count": 2147483648_i64}), json!({"name": "changed"})),
+            (json!({"name": 1}), json!({"count": 1})),
+            (json!({"id": 1}), json!({"name": "changed"})),
+            (json!({"count": 1}), json!({"count": 2})),
+            (json!({"count": 1}), json!({})),
+        ] {
+            let result = testing::run(
+                |_| panic!("invalid increment reached the database"),
+                repository.increment_if::<Value>(
+                    &json!({"id": 1}),
+                    &Filter::is_null(TABLE.columns[1]),
+                    &amounts,
+                    &patch,
+                ),
+            );
+            assert!(result.is_err());
+        }
+        for row in [json!({"id": 1}), json!({"name": "missing key"})] {
+            assert!(
+                testing::run(
+                    |_| panic!("invalid upsert reached the database"),
+                    repository.upsert::<Value>(&row)
+                )
+                .is_err()
+            );
+        }
     }
 }

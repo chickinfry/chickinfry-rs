@@ -16,7 +16,7 @@ const MAX_BYTES: usize = 8 * 1024;
 const MAX_ATTEMPTS: usize = 3;
 
 pub(crate) fn error(code: &str) -> ClientError {
-    ClientError::Protocol(format!("device_storage_{code}"))
+    ClientError::local(format!("device_storage_{code}"))
 }
 
 pub(crate) fn validate_path(path: &Path) -> Result<(), ClientError> {

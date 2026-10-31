@@ -167,12 +167,12 @@ fn corrupt_and_newer_files_are_preserved_and_blocked() {
     std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
     let before = std::fs::read(&path).unwrap();
     assert!(
-        matches!(Device::open(&f.0, f.scope()), Err(ClientError::Protocol(code)) if code == "device_storage_version_unsupported")
+        matches!(Device::open(&f.0, f.scope()), Err(ClientError { message: code, .. }) if code == "device_storage_version_unsupported")
     );
     assert!(std::fs::read(&path).unwrap() == before);
     std::fs::write(&path, b"corrupt data").unwrap();
     assert!(
-        matches!(Device::open(&f.0, f.scope()), Err(ClientError::Protocol(code)) if code == "device_storage_corrupt")
+        matches!(Device::open(&f.0, f.scope()), Err(ClientError { message: code, .. }) if code == "device_storage_corrupt")
     );
     assert!(std::fs::read(&path).unwrap() == b"corrupt data");
 }
@@ -236,7 +236,7 @@ fn subprocess() {
     let opened = Device::open(&root, scope.clone());
     let d = match opened {
         Ok(device) => device,
-        Err(ClientError::Protocol(code))
+        Err(ClientError { message: code, .. })
             if matches!(mode.as_str(), "competing-write" | "claim")
                 && code == "device_storage_unavailable" =>
         {
@@ -246,11 +246,11 @@ fn subprocess() {
     };
     match mode.as_str() {
         "pinned-dir-write" | "pinned-dir-read" => {
-            use crate::client::Client;
+            use crate::client::HttpTransport;
             std::env::set_current_dir(&root).unwrap();
-            let client = Client::new("https://example.com").unwrap();
+            let client = HttpTransport::new("https://example.com", None).unwrap();
             assert!(
-                matches!(client.with_persist(Persist::Dir(PathBuf::new())), Err(ClientError::Protocol(code)) if code == "device_storage_unavailable")
+                matches!(client.with_persist(Persist::Dir(PathBuf::new())), Err(ClientError { message: code, .. }) if code == "device_storage_unavailable")
             );
             let client = client.with_persist(Persist::Dir("nested".into())).unwrap();
             std::env::set_current_dir(root.parent().unwrap()).unwrap();
@@ -269,7 +269,7 @@ fn subprocess() {
             }
         }
         "default-write" | "default-read" | "relative-write" | "relative-read" => {
-            let client = crate::client::Client::new("https://example.com").unwrap();
+            let client = crate::client::HttpTransport::new("https://example.com", None).unwrap();
             let store = client.device_store(scope).unwrap().unwrap();
             if matches!(mode.as_str(), "default-write" | "relative-write") {
                 let mut state = store.read().unwrap();
@@ -322,7 +322,7 @@ fn subprocess() {
             match outcome {
                 Ok(Some(_)) => (),
                 Ok(None) => std::process::exit(7),
-                Err(ClientError::Protocol(code)) if code == "device_storage_unavailable" => {
+                Err(ClientError { message: code, .. }) if code == "device_storage_unavailable" => {
                     std::process::exit(8)
                 }
                 Err(_) => panic!("refresh claim failed"),
@@ -420,7 +420,7 @@ fn failed_refresh_commit_preserves_marker_and_blocks_reuse_after_restart() {
     #[cfg(windows)]
     drop(blocker);
     assert!(
-        matches!(result, Err(ClientError::Protocol(code)) if code == "device_storage_unavailable")
+        matches!(result, Err(ClientError { message: code, .. }) if code == "device_storage_unavailable")
     );
     let persisted = d.read().unwrap();
     assert_eq!(persisted.generation, claimed.generation);
@@ -459,14 +459,14 @@ fn capacity_rejection_preserves_previous_state() {
             .insert(key(screen, "attempt"), b"synthetic-attempt".to_vec());
     }
     assert!(
-        matches!(d.replace(0, state), Err(ClientError::Protocol(code)) if code == "device_storage_full")
+        matches!(d.replace(0, state), Err(ClientError { message: code, .. }) if code == "device_storage_full")
     );
     let mut state = d.read().unwrap();
     state
         .records
         .insert(key("user-a", "session"), vec![b'x'; 8193]);
     assert!(
-        matches!(d.replace(0, state), Err(ClientError::Protocol(code)) if code == "device_storage_full")
+        matches!(d.replace(0, state), Err(ClientError { message: code, .. }) if code == "device_storage_full")
     );
     assert!(d.read().unwrap().records.is_empty());
 }
@@ -477,7 +477,7 @@ fn locked_file_does_not_become_an_empty_session() {
     let d = f.open();
     let blocker = d.lock().unwrap();
     assert!(
-        matches!(d.read(), Err(ClientError::Protocol(code)) if code == "device_storage_unavailable")
+        matches!(d.read(), Err(ClientError { message: code, .. }) if code == "device_storage_unavailable")
     );
     drop(blocker);
     assert!(d.read().is_ok());
@@ -499,7 +499,7 @@ fn swapped_scope_is_never_reset_or_returned() {
     std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
     let before = std::fs::read(&path).unwrap();
     assert!(
-        matches!(d.read(), Err(ClientError::Protocol(code)) if code == "device_storage_corrupt")
+        matches!(d.read(), Err(ClientError { message: code, .. }) if code == "device_storage_corrupt")
     );
     assert!(std::fs::read(&path).unwrap() == before);
 }
@@ -615,7 +615,7 @@ fn hosted_file_permissions_survive_process_restart_and_logout() {
             .status;
         assert!(status.success());
         assert!(
-            matches!(d.read(), Err(ClientError::Protocol(code)) if code == "device_storage_unavailable")
+            matches!(d.read(), Err(ClientError { message: code, .. }) if code == "device_storage_unavailable")
         );
         let f = Fixture::new();
         let d = f.open();
@@ -652,7 +652,7 @@ if ($actual.AreAccessRulesProtected -or $rules.Count -ne 1 -or
             .status;
         assert!(status.success());
         assert!(
-            matches!(d.read(), Err(ClientError::Protocol(code)) if code == "device_storage_unavailable")
+            matches!(d.read(), Err(ClientError { message: code, .. }) if code == "device_storage_unavailable")
         );
     }
 }
@@ -682,7 +682,7 @@ fn existing_owned_directory_can_be_traversable_but_not_writable_by_others() {
     assert!(d.replace(0, Snapshot::default()).unwrap());
     std::fs::set_permissions(&f.0, std::fs::Permissions::from_mode(0o777)).unwrap();
     assert!(
-        matches!(d.read(), Err(ClientError::Protocol(code)) if code == "device_storage_unavailable")
+        matches!(d.read(), Err(ClientError { message: code, .. }) if code == "device_storage_unavailable")
     );
 }
 
@@ -697,7 +697,7 @@ fn relative_directory_is_pinned_before_chdir_and_empty_is_rejected() {
 fn windows_acl_rejects_missing_inheritance_protection() {
     assert!(
         matches!(files::private_windows_acl(0, 0, u32::MAX, "current-user", "current-user"),
-        Err(ClientError::Protocol(code)) if code == "device_storage_unavailable")
+        Err(ClientError { message: code, .. }) if code == "device_storage_unavailable")
     );
 }
 
@@ -705,7 +705,7 @@ fn windows_acl_rejects_missing_inheritance_protection() {
 fn windows_acl_rejects_inherited_allow_entries() {
     assert!(
         matches!(files::private_windows_acl(0x1000, 0x10, u32::MAX, "current-user", "current-user"),
-        Err(ClientError::Protocol(code)) if code == "device_storage_unavailable")
+        Err(ClientError { message: code, .. }) if code == "device_storage_unavailable")
     );
 }
 
@@ -716,7 +716,7 @@ fn windows_acl_rejects_another_principal() {
     );
     assert!(
         matches!(files::private_windows_acl(0x1000, 0, u32::MAX, "another-user", "current-user"),
-        Err(ClientError::Protocol(code)) if code == "device_storage_unavailable")
+        Err(ClientError { message: code, .. }) if code == "device_storage_unavailable")
     );
 }
 
@@ -747,7 +747,7 @@ fn macos_acl_rejects_other_principals_on_existing_files_and_sidecars() {
         chmod_acl(&path, None);
         assert_eq!(mode, 0o600);
         assert!(
-            matches!(result, Err(ClientError::Protocol(code)) if code == "device_storage_unavailable")
+            matches!(result, Err(ClientError { message: code, .. }) if code == "device_storage_unavailable")
         );
     }
 }
@@ -771,10 +771,10 @@ fn macos_acl_rejects_inherited_access_before_new_file_writes() {
     assert_eq!(mode, 0o700);
     assert_eq!(length, 0);
     assert!(
-        matches!(read, Err(ClientError::Protocol(code)) if code == "device_storage_unavailable")
+        matches!(read, Err(ClientError { message: code, .. }) if code == "device_storage_unavailable")
     );
     assert!(
-        matches!(created, Err(ClientError::Protocol(code)) if code == "device_storage_unavailable")
+        matches!(created, Err(ClientError { message: code, .. }) if code == "device_storage_unavailable")
     );
 }
 

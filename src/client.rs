@@ -72,20 +72,81 @@ impl fmt::Display for OperationError {
     }
 }
 
-/// Client failures: local protocol and usage problems, and server-reported
+/// HttpTransport failures: local protocol and usage problems, and server-reported
 /// operation errors that preserve the wire error code and HTTP status.
 #[derive(Clone, Debug)]
-pub enum ClientError {
-    /// The request could not be built, bounded, or decoded.
-    Protocol(String),
-    /// The server answered with an operation error code and HTTP status.
-    Operation(OperationError),
+pub struct ClientError {
+    pub code: String,
+    pub status: Option<u16>,
+    pub outcome_unknown: bool,
+    pub operation_error: Option<OperationError>,
+    pub message: String,
+}
+
+impl ClientError {
+    pub fn new(code: &str, status: Option<u16>, outcome_unknown: bool) -> Self {
+        Self {
+            code: code.into(),
+            status,
+            outcome_unknown,
+            operation_error: None,
+            message: code.into(),
+        }
+    }
+
+    pub(crate) fn local(message: String) -> Self {
+        let code = match message.as_str() {
+            "device_storage_corrupt" => "data_loss",
+            "device_storage_full" => "resource_exhausted",
+            "device_storage_version_unsupported" => "unimplemented",
+            "device_storage_unavailable" | "session store is bound to a different origin" => {
+                "failed_precondition"
+            }
+            "session refresh failed" => "unauthenticated",
+            "invalid operation response field" | "invalid refresh response" => "internal",
+            message
+                if message.starts_with("The request is too large.")
+                    || message.starts_with("The response is too large.") =>
+            {
+                "resource_exhausted"
+            }
+            message
+                if message.starts_with("Could not complete the request.")
+                    || message.starts_with("Could not read the response.") =>
+            {
+                "unavailable"
+            }
+            message if message.starts_with("invalid ") || message.starts_with("operation ") => {
+                "invalid_argument"
+            }
+            _ => "unknown",
+        };
+        let outcome_unknown = matches!(
+            message.as_str(),
+            "invalid operation response field" | "invalid refresh response"
+        );
+        Self {
+            message,
+            ..Self::new(code, None, outcome_unknown)
+        }
+    }
+
+    fn remote(error: OperationError) -> Self {
+        Self {
+            code: error.code.clone(),
+            status: Some(error.status),
+            outcome_unknown: false,
+            message: error.to_string(),
+            operation_error: Some(error),
+        }
+    }
 }
 
 impl fmt::Display for ClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ClientError::Protocol(message) => {
+        match &self.operation_error {
+            None => {
+                let message = &self.message;
                 let description = match message.as_str() {
                     "device_storage_unavailable" => {
                         "Could not use device storage for the session. Check that the storage location is writable, or set persist to another directory or turn it off."
@@ -103,12 +164,29 @@ impl fmt::Display for ClientError {
                 };
                 write!(formatter, "{description}")
             }
-            ClientError::Operation(error) => write!(formatter, "{error}"),
+            Some(error) => write!(formatter, "{error}"),
         }
     }
 }
 
-impl std::error::Error for ClientError {}
+impl std::error::Error for ClientError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.operation_error.as_ref().map(|error| error as _)
+    }
+}
+
+impl std::error::Error for OperationError {}
+
+/// Replaceable operation transport shared by generated service clients.
+pub trait Transport: Send + Sync {
+    fn invoke(&self, operation: &str, input: &Value) -> Result<Value, ClientError>;
+}
+
+impl Transport for HttpTransport {
+    fn invoke(&self, operation: &str, input: &Value) -> Result<Value, ClientError> {
+        HttpTransport::invoke(self, operation, input)
+    }
+}
 
 /// The rotating credential bundle a session store persists.
 #[derive(Clone, Deserialize, PartialEq)]
@@ -161,12 +239,12 @@ pub trait SessionStore: Send + Sync + 'static {
 }
 
 /// An origin-bound session store that keeps credentials in process memory.
-pub struct MemorySessionStore {
+pub struct MemoryStore {
     origin: String,
     credentials: Mutex<Option<SessionCredentials>>,
 }
 
-impl MemorySessionStore {
+impl MemoryStore {
     /// Creates a store for one validated origin and credential pair.
     pub fn new(origin: &str, credentials: Option<SessionCredentials>) -> Result<Self, ClientError> {
         let store = Self {
@@ -187,7 +265,7 @@ impl MemorySessionStore {
     /// Replaces the current record after validating its credential pair.
     pub fn write(&self, credentials: SessionCredentials) -> Result<(), ClientError> {
         if !valid_token(&credentials.access_token) || !valid_token(&credentials.refresh_token) {
-            return Err(ClientError::Protocol("invalid session credential".into()));
+            return Err(ClientError::local("invalid session credential".into()));
         }
         *self.credentials.lock().expect("session store") = Some(credentials);
         Ok(())
@@ -210,7 +288,7 @@ impl MemorySessionStore {
     }
 }
 
-impl SessionStore for MemorySessionStore {
+impl SessionStore for MemoryStore {
     fn bound_origin(&self) -> String {
         self.origin.clone()
     }
@@ -231,7 +309,7 @@ impl SessionStore for MemorySessionStore {
         let expected = self.read().ok_or_else(session_refresh_failed)?;
         let refreshed = operation(expected.clone())?;
         if !valid_token(&refreshed.access_token) || !valid_token(&refreshed.refresh_token) {
-            return Err(ClientError::Protocol("invalid session credential".into()));
+            return Err(ClientError::local("invalid session credential".into()));
         }
         let mut current = self.credentials.lock().expect("session store");
         if current.as_ref() != Some(&expected) {
@@ -250,7 +328,7 @@ impl SessionStore for MemorySessionStore {
 
 /// Shared client runtime behind generated Rust SDKs.
 #[derive(Clone)]
-pub struct Client {
+pub struct HttpTransport {
     agent: ureq::Agent,
     origin: String,
     bearer: Option<String>,
@@ -259,16 +337,12 @@ pub struct Client {
     device: Arc<Mutex<Option<Arc<device::Device>>>>,
 }
 
-impl Client {
+impl HttpTransport {
     /// Builds a client for a fixed HTTPS or loopback HTTP origin.
-    pub fn new(origin: &str) -> Result<Self, ClientError> {
-        Self::with_timeout(origin, DEFAULT_TIMEOUT)
-    }
-
-    /// Builds a client with an explicit finite timeout for every request.
-    pub fn with_timeout(origin: &str, timeout: Duration) -> Result<Self, ClientError> {
+    pub fn new(origin: &str, timeout: Option<Duration>) -> Result<Self, ClientError> {
+        let timeout = timeout.unwrap_or(DEFAULT_TIMEOUT);
         if timeout.is_zero() {
-            return Err(ClientError::Protocol(
+            return Err(ClientError::local(
                 "operation timeout must be positive".into(),
             ));
         }
@@ -301,7 +375,7 @@ impl Client {
     /// Returns a copy that sends the given bearer token and no session store.
     pub fn with_bearer(&self, token: &str) -> Result<Self, ClientError> {
         if !valid_token(token) {
-            return Err(ClientError::Protocol("invalid access token".into()));
+            return Err(ClientError::local("invalid access token".into()));
         }
         let mut copy = self.clone();
         copy.bearer = Some(token.to_owned());
@@ -398,7 +472,9 @@ impl Client {
         #[cfg(feature = "conformance")]
         conformance::emit(conformance::Event::Entered);
         let Some(store) = self.session.as_ref() else {
-            return self.invoke_once(operation, input, self.bearer.as_deref(), None);
+            return self
+                .invoke_once(operation, input, self.bearer.as_deref(), None)
+                .map(|(value, _)| value);
         };
         let credentials = store.credentials();
         self.guard_store_credentials(store, &credentials)?;
@@ -409,8 +485,11 @@ impl Client {
         };
         let result = self.invoke_once(operation, input, token.as_deref(), None);
         match result {
-            Err(ClientError::Operation(OperationError { code, status: 401 }))
-                if operation != REFRESH_OPERATION && code == "invalid_token" =>
+            Err(error)
+                if operation != REFRESH_OPERATION
+                    && error.operation_error.as_ref().is_some_and(|error| {
+                        error.status == 401 && error.code == "invalid_token"
+                    }) =>
             {
                 #[cfg(feature = "conformance")]
                 conformance::emit(conformance::Event::OriginalRejected {
@@ -421,6 +500,7 @@ impl Client {
             }
             other => other,
         }
+        .map(|(value, _)| value)
     }
 
     fn refresh_session(
@@ -441,6 +521,14 @@ impl Client {
             match flights.get(&refresh_token) {
                 Some(existing) => existing.clone(),
                 None => {
+                    let fingerprint: [u8; 32] = Sha256::digest(refresh_token.as_bytes()).into();
+                    if blocked_refresh_tokens()
+                        .lock()
+                        .expect("refresh token gate")
+                        .contains(&fingerprint)
+                    {
+                        return Err(invalid_token_error());
+                    }
                     let flight = Arc::new(Flight::default());
                     flights.insert(refresh_token.clone(), flight.clone());
                     leader = true;
@@ -470,14 +558,10 @@ impl Client {
                     .expect("refresh token gate")
                     .insert(Sha256::digest(current.refresh_token.as_bytes()).into());
             }
-            // A failed exchange may have consumed the token, including a failed save.
-            flight.finish(outcome.clone().map_err(|_| invalid_token_error()));
-            if outcome.is_ok() || confirmed_rejection {
-                refreshes
-                    .map
-                    .lock()
-                    .expect("refresh flight map")
-                    .remove(&refresh_token);
+            {
+                let mut flights = refreshes.map.lock().expect("refresh flight map");
+                flight.finish(outcome.clone());
+                flights.remove(&refresh_token);
             }
             outcome?;
         }
@@ -514,13 +598,16 @@ impl Client {
                     return Err(invalid_token_error());
                 }
                 attempted_token = Some(fingerprint);
-                let value = self.invoke_once(
+                let (value, status) = self.invoke_once(
                     REFRESH_OPERATION,
                     &serde_json::json!({ "refresh_token": latest.refresh_token }),
                     None,
                     Some(&mut refresh_rejected),
                 )?;
-                read_credentials(value)
+                read_credentials(value).map_err(|mut error| {
+                    error.status = Some(status);
+                    error
+                })
             })();
             if let Err(error) = &result {
                 callback_error = Some(error.clone());
@@ -549,7 +636,14 @@ impl Client {
                             .remove(&fingerprint);
                     }
                 }
-                Err(callback_error.unwrap_or_else(session_refresh_failed))
+                Err(callback_error.unwrap_or_else(|| {
+                    let mut error = session_refresh_failed();
+                    if attempted_token.is_some() {
+                        error.code = "failed_precondition".into();
+                        error.outcome_unknown = true;
+                    }
+                    error
+                }))
             }
         }
     }
@@ -560,14 +654,14 @@ impl Client {
         input: &Value,
         bearer: Option<&str>,
         rejected: Option<&mut bool>,
-    ) -> Result<Value, ClientError> {
+    ) -> Result<(Value, u16), ClientError> {
         if !valid_operation_name(operation) {
-            return Err(ClientError::Protocol("invalid operation name".into()));
+            return Err(ClientError::local("invalid operation name".into()));
         }
         let body = serde_json::to_vec(input)
-            .map_err(|_| ClientError::Protocol("invalid operation request".into()))?;
+            .map_err(|_| ClientError::local("invalid operation request".into()))?;
         if body.len() > MAX_REQUEST_BYTES {
-            return Err(ClientError::Protocol(
+            return Err(ClientError::local(
                 "The request is too large. Reduce the submitted data and try again.".into(),
             ));
         }
@@ -584,10 +678,13 @@ impl Client {
         });
         let response = request
             .send(body)
-            .map_err(|_| {
-                ClientError::Protocol(
+            .map_err(|error| {
+                let mut failure = ClientError::local(
                     "Could not complete the request. Check your connection and confirm the operation outcome before trying again.".into(),
-                )
+                );
+                if matches!(error, ureq::Error::Timeout(_)) { failure.code = "deadline_exceeded".into(); }
+                failure.outcome_unknown = true;
+                failure
             })?;
         let status = response.status().as_u16();
         #[cfg(feature = "conformance")]
@@ -621,10 +718,7 @@ impl Client {
                 });
                 conformance::emit(conformance::Event::ResponseComplete);
             }
-            return Err(ClientError::Operation(OperationError {
-                code: "redirect_not_allowed".into(),
-                status,
-            }));
+            return Err(ClientError::new("internal", Some(status), true));
         }
         let reader = response.into_body().into_reader();
         let mut data = Vec::new();
@@ -645,25 +739,30 @@ impl Client {
             bytes: 0,
             retained: Some(data.capacity()),
         });
-        result.map_err(|_| {
-            ClientError::Protocol(
+        result.map_err(|error| {
+            let mut failure = ClientError::local(
                 "Could not read the response. Confirm the operation outcome before trying again."
                     .into(),
-            )
+            );
+            if error.kind() == std::io::ErrorKind::TimedOut
+                || matches!(ureq::Error::from(error), ureq::Error::Timeout(_))
+            {
+                failure.code = "deadline_exceeded".into();
+            }
+            failure.status = Some(status);
+            failure.outcome_unknown = true;
+            failure
         })?;
         if data.len() > MAX_RESPONSE_BYTES {
-            return Err(ClientError::Protocol(
-                "The response is too large. The operation may have completed; confirm its outcome before requesting less data.".into(),
-            ));
+            let mut failure = ClientError::local("The response is too large. The operation may have completed; confirm its outcome before requesting less data.".into());
+            failure.status = Some(status);
+            failure.outcome_unknown = true;
+            return Err(failure);
         }
         #[cfg(feature = "conformance")]
         conformance::emit(conformance::Event::ResponseComplete);
-        let value: Value = serde_json::from_slice(&data).map_err(|_| {
-            ClientError::Operation(OperationError {
-                code: "invalid_response".into(),
-                status,
-            })
-        })?;
+        let value: Value = serde_json::from_slice(&data)
+            .map_err(|_| ClientError::new("internal", Some(status), true))?;
         if !(200..300).contains(&status) {
             let code = match value.get("error").and_then(Value::as_str) {
                 Some(code) if valid_error_code(code) => {
@@ -674,11 +773,15 @@ impl Client {
                     }
                     code.to_owned()
                 }
-                _ => "invalid_response".into(),
+                _ => return Err(ClientError::new("internal", Some(status), true)),
             };
-            return Err(ClientError::Operation(OperationError { code, status }));
+            let mut error = ClientError::remote(OperationError { code, status });
+            error.outcome_unknown = operation == REFRESH_OPERATION
+                && self.session.is_some()
+                && (status == 429 || status >= 500);
+            return Err(error);
         }
-        Ok(value)
+        Ok((value, status))
     }
 
     /// Rejects any credential use unless the store is bound to this client's
@@ -692,12 +795,12 @@ impl Client {
     ) -> Result<(), ClientError> {
         let bound = validate_origin(&store.bound_origin())?;
         if bound != self.origin {
-            return Err(ClientError::Protocol(
+            return Err(ClientError::local(
                 "session store is bound to a different origin".into(),
             ));
         }
         if !valid_token(&credentials.access_token) || !valid_token(&credentials.refresh_token) {
-            return Err(ClientError::Protocol("invalid session credential".into()));
+            return Err(ClientError::local("invalid session credential".into()));
         }
         Ok(())
     }
@@ -711,9 +814,8 @@ fn read_response(reader: &mut impl Read, data: &mut Vec<u8>) -> std::io::Result<
     loop {
         let length = data.len();
         let result = if data.is_empty() {
-            reader.read(&mut probe).map(|count| {
+            reader.read(&mut probe).inspect(|&count| {
                 data.extend_from_slice(&probe[..count]);
-                count
             })
         } else {
             if data.capacity() - length < 32 {
@@ -765,15 +867,14 @@ fn read_response(reader: &mut impl Read, data: &mut Vec<u8>) -> std::io::Result<
 
 /// Serializes a generated input struct into the transport envelope.
 pub fn encode_input<T: serde::Serialize>(input: &T) -> Result<Value, ClientError> {
-    serde_json::to_value(input)
-        .map_err(|_| ClientError::Protocol("invalid operation request".into()))
+    serde_json::to_value(input).map_err(|_| ClientError::local("invalid operation request".into()))
 }
 
 /// Decodes a response into a generated output struct, rejecting missing,
 /// null, or mistyped required fields.
 pub fn decode_output<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, ClientError> {
     serde_json::from_value(value)
-        .map_err(|_| ClientError::Protocol("invalid operation response field".into()))
+        .map_err(|_| ClientError::local("invalid operation response field".into()))
 }
 
 #[derive(Default)]
@@ -790,17 +891,18 @@ fn blocked_refresh_tokens() -> &'static Mutex<HashSet<[u8; 32]>> {
 }
 
 fn invalid_token_error() -> ClientError {
-    ClientError::Operation(OperationError {
-        code: "invalid_token".into(),
-        status: 401,
-    })
+    ClientError::new("unauthenticated", None, false)
 }
 
 fn session_refresh_failed() -> ClientError {
-    ClientError::Protocol("session refresh failed".into())
+    ClientError::local("session refresh failed".into())
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "The session integration suite supplies the join observer."
+)]
 pub(crate) fn observe_refresh_joins(
     store: &Arc<dyn SessionStore>,
     observer: std::sync::mpsc::Sender<()>,
@@ -808,8 +910,8 @@ pub(crate) fn observe_refresh_joins(
     *store_flights(store).joined.lock().expect("join observer") = Some(observer);
 }
 
-static STORE_FLIGHTS: OnceLock<Mutex<Vec<(Weak<dyn SessionStore>, Arc<RefreshFlights>)>>> =
-    OnceLock::new();
+type SharedRefreshFlights = Vec<(Weak<dyn SessionStore>, Arc<RefreshFlights>)>;
+static STORE_FLIGHTS: OnceLock<Mutex<SharedRefreshFlights>> = OnceLock::new();
 
 /// Returns the refresh flight table bound to one session store, so every
 /// client using the same store shares a single-flight rotation.
@@ -858,9 +960,8 @@ impl Flight {
 }
 
 fn validate_origin(origin: &str) -> Result<String, ClientError> {
-    let invalid = || {
-        ClientError::Protocol("operation endpoint must be an HTTPS or loopback HTTP origin".into())
-    };
+    let invalid =
+        || ClientError::local("operation endpoint must be an HTTPS or loopback HTTP origin".into());
     if origin.contains(['?', '#']) {
         // Reject even empty markers before URI parsing can discard them.
         return Err(invalid());
@@ -883,7 +984,7 @@ fn validate_origin(origin: &str) -> Result<String, ClientError> {
 
 fn read_credentials(value: Value) -> Result<SessionCredentials, ClientError> {
     let credentials: SessionCredentials = serde_json::from_value(value)
-        .map_err(|_| ClientError::Protocol("invalid refresh response".into()))?;
+        .map_err(|_| ClientError::local("invalid refresh response".into()))?;
     if !valid_token(&credentials.access_token)
         || !valid_token(&credentials.refresh_token)
         || credentials.expires_at.is_empty()
@@ -891,7 +992,7 @@ fn read_credentials(value: Value) -> Result<SessionCredentials, ClientError> {
         || credentials.user_id.is_empty()
         || credentials.session_id.is_empty()
     {
-        return Err(ClientError::Protocol("invalid refresh response".into()));
+        return Err(ClientError::local("invalid refresh response".into()));
     }
     Ok(credentials)
 }
@@ -921,6 +1022,7 @@ fn valid_segment(segment: &str) -> bool {
 
 fn valid_error_code(code: &str) -> bool {
     !code.is_empty()
+        && code.len() <= 64
         && code
             .bytes()
             .all(|byte| byte == b'_' || byte.is_ascii_lowercase())
@@ -929,3 +1031,17 @@ fn valid_error_code(code: &str) -> bool {
 #[cfg(test)]
 #[path = "device/tests.rs"]
 mod device_tests;
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    #[test]
+    fn default_http_timeout_is_thirty_seconds() {
+        let transport = HttpTransport::new("https://example.com", None).unwrap();
+        assert_eq!(
+            transport.agent.config().timeouts().global,
+            Some(Duration::from_millis(30_000))
+        );
+    }
+}

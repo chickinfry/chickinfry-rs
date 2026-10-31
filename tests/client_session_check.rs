@@ -1,6 +1,10 @@
 //! Focused session checks: one refresh per invalid session, one retry,
 //! single-flight rotation, and expected-credential clearing.
 
+#[allow(
+    dead_code,
+    reason = "Each integration suite exercises a subset of the client module."
+)]
 #[path = "../src/client.rs"]
 mod client;
 
@@ -12,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
 use base64::Engine;
-use client::{Client, ClientError, SessionCredentials, SessionStore};
+use client::{ClientError, HttpTransport, SessionCredentials, SessionStore};
 use common::{response, serve, serve_with};
 use error::assert_safe_protocol;
 use serde_json::json;
@@ -127,11 +131,8 @@ impl SessionStore for MemoryStore {
     }
 }
 
-fn operation_status_and_code(error: ClientError) -> (u16, String) {
-    match error {
-        ClientError::Operation(error) => (error.status, error.code),
-        other => panic!("expected operation error, got {other}"),
-    }
+fn operation_status_and_code(error: ClientError) -> (Option<u16>, String) {
+    (error.status, error.code)
 }
 
 fn unwrap_credentials(store: &MemoryStore) -> SessionCredentials {
@@ -154,7 +155,7 @@ fn refreshes_once_and_retries_original() {
         response("HTTP/1.1 200 OK", "{\"ok\":true}"),
     ]);
     let store = MemoryStore::new(&origin, credentials("old_access", "old_refresh"));
-    let client = Client::with_timeout(&origin, std::time::Duration::from_secs(10))
+    let client = HttpTransport::new(&origin, Some(std::time::Duration::from_secs(10)))
         .expect("valid origin")
         .with_session(store.clone())
         .expect("valid session");
@@ -232,27 +233,38 @@ fn keeps_business_failures_and_never_refreshes_refresh_calls() {
         response("HTTP/1.1 409 Conflict", "{\"error\":\"out_of_stock\"}"),
         response("HTTP/1.1 401 Unauthorized", "{\"error\":\"invalid_token\"}"),
         response("HTTP/1.1 401 Unauthorized", "{\"error\":\"forbidden\"}"),
+        response(
+            "HTTP/1.1 500 Internal Server Error",
+            "{\"error\":\"internal_error\"}",
+        ),
     ]);
     let store = MemoryStore::new(&origin, credentials("access", "refresh"));
-    let client = Client::with_timeout(&origin, std::time::Duration::from_secs(10))
+    let client = HttpTransport::new(&origin, Some(std::time::Duration::from_secs(10)))
         .expect("valid origin")
         .with_session(store.clone())
         .expect("valid session");
 
     let (status, code) =
         operation_status_and_code(client.invoke("catalog.find", &json!({})).unwrap_err());
-    assert_eq!((status, code.as_str()), (409, "out_of_stock"));
+    assert_eq!((status, code.as_str()), (Some(409), "out_of_stock"));
 
     let (status, code) =
         operation_status_and_code(client.invoke("auth.refresh", &json!({})).unwrap_err());
-    assert_eq!((status, code.as_str()), (401, "invalid_token"));
+    assert_eq!((status, code.as_str()), (Some(401), "invalid_token"));
 
     let (status, code) =
         operation_status_and_code(client.invoke("catalog.find", &json!({})).unwrap_err());
-    assert_eq!((status, code.as_str()), (401, "forbidden"));
+    assert_eq!((status, code.as_str()), (Some(401), "forbidden"));
+
+    let error = client.invoke("catalog.find", &json!({})).unwrap_err();
+    assert_eq!(error.code, "internal_error");
+    assert_eq!(error.status, Some(500));
+    assert!(error.operation_error.is_some());
+    assert!(!error.outcome_unknown);
 
     assert_eq!(receiver.recv().expect("recorded").path, "/catalog.find");
     assert_eq!(receiver.recv().expect("recorded").path, "/auth.refresh");
+    assert_eq!(receiver.recv().expect("recorded").path, "/catalog.find");
     assert_eq!(receiver.recv().expect("recorded").path, "/catalog.find");
     assert_eq!(store.refresh_calls.load(Ordering::SeqCst), 0);
     assert!(store.cleared.lock().expect("cleared log").is_empty());
@@ -265,14 +277,14 @@ fn clears_only_expected_credential_when_refresh_rejected() {
         response("HTTP/1.1 401 Unauthorized", "{\"error\":\"invalid_token\"}"),
     ]);
     let store = MemoryStore::new(&origin, credentials("access", "refresh"));
-    let client = Client::with_timeout(&origin, std::time::Duration::from_secs(10))
+    let client = HttpTransport::new(&origin, Some(std::time::Duration::from_secs(10)))
         .expect("valid origin")
         .with_session(store.clone())
         .expect("valid session");
 
     let (status, code) =
         operation_status_and_code(client.invoke("catalog.find", &json!({})).unwrap_err());
-    assert_eq!((status, code.as_str()), (401, "invalid_token"));
+    assert_eq!((status, code.as_str()), (Some(401), "invalid_token"));
 
     let cleared = store.cleared.lock().expect("cleared log");
     assert_eq!(cleared.len(), 1);
@@ -333,7 +345,7 @@ fn keeps_rotated_credentials_without_second_refresh() {
         state: Mutex::new(Some(credentials("old_access", "old_refresh"))),
         reads: AtomicUsize::new(0),
     });
-    let client = Client::with_timeout(&origin, std::time::Duration::from_secs(10))
+    let client = HttpTransport::new(&origin, Some(std::time::Duration::from_secs(10)))
         .expect("valid origin")
         .with_session(store.clone())
         .expect("valid session");
@@ -377,7 +389,7 @@ fn single_flight_rotates_once_for_concurrent_callers() {
     let store = MemoryStore::new(&origin, credentials("old_access", "old_refresh"));
     client::observe_refresh_joins(&(store.clone() as Arc<dyn SessionStore>), joined_sender);
     let client = Arc::new(
-        Client::with_timeout(&origin, std::time::Duration::from_secs(10))
+        HttpTransport::new(&origin, Some(std::time::Duration::from_secs(10)))
             .expect("valid origin")
             .with_session(store.clone())
             .expect("valid session"),
@@ -456,7 +468,7 @@ fn separate_clients_on_one_store_share_single_flight() {
     let store = MemoryStore::new(&origin, credentials("old_access", "old_refresh"));
     client::observe_refresh_joins(&(store.clone() as Arc<dyn SessionStore>), joined_sender);
     let build = || {
-        Client::with_timeout(&origin, std::time::Duration::from_secs(10))
+        HttpTransport::new(&origin, Some(std::time::Duration::from_secs(10)))
             .expect("valid origin")
             .with_session(store.clone())
             .expect("valid session")
@@ -511,11 +523,10 @@ fn rejects_wrong_origin_store_before_any_request() {
         "https://elsewhere.example.com",
         credentials("access", "refresh"),
     );
-    let client =
-        Client::with_timeout(&origin, std::time::Duration::from_secs(10)).expect("valid origin");
+    let client = HttpTransport::new(&origin, Some(std::time::Duration::from_secs(10)))
+        .expect("valid origin");
     let error = match client.with_session(store) {
-        Err(ClientError::Protocol(message)) => message,
-        Err(other) => panic!("expected protocol error, got {other}"),
+        Err(ClientError { message, .. }) => message,
         Ok(_) => panic!("a wrong-origin store must not attach"),
     };
     assert_eq!(error, "session store is bound to a different origin");
@@ -573,7 +584,7 @@ fn unknown_refresh_blocks_later_calls_on_the_same_store() {
                 "HTTP/1.1 200 OK",
                 &refresh_body("rotated", "rotated_refresh"),
             ),
-            Some(ClientError::Protocol("could not save session".into())),
+            Some(ClientError::local("could not save session".into())),
         ),
         (
             "save-401",
@@ -581,18 +592,38 @@ fn unknown_refresh_blocks_later_calls_on_the_same_store() {
                 "HTTP/1.1 200 OK",
                 &refresh_body("rotated", "rotated_refresh"),
             ),
-            Some(ClientError::Operation(client::OperationError {
-                code: "invalid_token".into(),
-                status: 401,
-            })),
+            Some(ClientError {
+                operation_error: Some(client::OperationError {
+                    code: "invalid_token".into(),
+                    status: 401,
+                }),
+                ..ClientError::new("unauthenticated", None, false)
+            }),
         ),
     ] {
-        let (origin, receiver) = serve(&[
-            response("HTTP/1.1 401 Unauthorized", r#"{"error":"invalid_token"}"#),
-            reply,
-            response("HTTP/1.1 401 Unauthorized", r#"{"error":"invalid_token"}"#),
-            response("HTTP/1.1 200 OK", r#"{"ok":true}"#),
-        ]);
+        let originals = Barrier::new(2);
+        let (arrived, arrival) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let held = Mutex::new(held);
+        let (joined_sender, joined) = std::sync::mpsc::channel();
+        let (origin, receiver) = serve_with(
+            &[
+                response("HTTP/1.1 401 Unauthorized", r#"{"error":"invalid_token"}"#),
+                response("HTTP/1.1 401 Unauthorized", r#"{"error":"invalid_token"}"#),
+                reply,
+                response("HTTP/1.1 401 Unauthorized", r#"{"error":"invalid_token"}"#),
+                response("HTTP/1.1 200 OK", r#"{"ok":true}"#),
+            ],
+            move |index| {
+                if index < 2 {
+                    originals.wait();
+                }
+                if index == 2 {
+                    arrived.send(()).unwrap();
+                    held.lock().unwrap().recv().unwrap();
+                }
+            },
+        );
         let initial = credentials(
             &format!("old_access_{name}"),
             &format!("old_refresh_{name}"),
@@ -603,19 +634,47 @@ fn unknown_refresh_blocks_later_calls_on_the_same_store() {
             save_failure,
             ..MemoryStore::default()
         });
-        let client = Client::new(&origin)
+        let client = HttpTransport::new(&origin, None)
             .unwrap()
             .with_session(store.clone())
             .unwrap();
-        assert!(client.invoke("catalog.find", &json!({})).is_err(), "{name}");
-        let later = Client::new(&origin)
+        client::observe_refresh_joins(&(store.clone() as Arc<dyn SessionStore>), joined_sender);
+        let first_client = client.clone();
+        let first = std::thread::spawn(move || first_client.invoke("catalog.find", &json!({})));
+        let second_client = client.clone();
+        let second = std::thread::spawn(move || second_client.invoke("catalog.find", &json!({})));
+        arrival
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        joined
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        release.send(()).unwrap();
+        let first_error = first.join().unwrap().unwrap_err();
+        let second_error = second.join().unwrap().unwrap_err();
+        assert_eq!(
+            (
+                &first_error.code,
+                first_error.status,
+                first_error.outcome_unknown
+            ),
+            (
+                &second_error.code,
+                second_error.status,
+                second_error.outcome_unknown
+            ),
+            "{name}: all participants must receive the refresh failure"
+        );
+        assert!(first_error.outcome_unknown, "{name}");
+        let later = HttpTransport::new(&origin, None)
             .unwrap()
             .with_session(store.clone())
             .unwrap();
         let error = later.invoke("catalog.find", &json!({})).unwrap_err();
+        assert!(!error.outcome_unknown, "{name}: later calls fail locally");
         assert_eq!(
             operation_status_and_code(error),
-            (401, "invalid_token".into()),
+            (None, "unauthenticated".into()),
             "{name}"
         );
         assert_eq!(store.refresh_calls.load(Ordering::SeqCst), 1, "{name}");
@@ -630,10 +689,11 @@ fn unknown_refresh_blocks_later_calls_on_the_same_store() {
             later.invoke("catalog.find", &json!({})).unwrap(),
             json!({"ok":true})
         );
-        let paths: Vec<_> = (0..4).map(|_| receiver.recv().unwrap().path).collect();
+        let paths: Vec<_> = (0..5).map(|_| receiver.recv().unwrap().path).collect();
         assert_eq!(
             paths,
             [
+                "/catalog.find",
                 "/catalog.find",
                 "/auth.refresh",
                 "/catalog.find",
@@ -663,7 +723,7 @@ fn timed_out_refresh_is_not_automatically_sent_again() {
         },
     );
     let store = MemoryStore::new(&origin, credentials("old_access", "old_refresh"));
-    let client = Client::with_timeout(&origin, std::time::Duration::from_millis(100))
+    let client = HttpTransport::new(&origin, Some(std::time::Duration::from_millis(100)))
         .unwrap()
         .with_session(store.clone())
         .unwrap();
@@ -674,7 +734,7 @@ fn timed_out_refresh_is_not_automatically_sent_again() {
     release.send(()).unwrap();
     assert_eq!(
         operation_status_and_code(client.invoke("catalog.find", &json!({})).unwrap_err()),
-        (401, "invalid_token".into())
+        (None, "unauthenticated".into())
     );
     assert_eq!(store.refresh_calls.load(Ordering::SeqCst), 1);
     let paths: Vec<_> = (0..3).map(|_| receiver.recv().unwrap().path).collect();
@@ -699,13 +759,13 @@ fn only_valid_401_error_envelopes_clear_expected_credentials() {
             &format!("old_refresh_{index}"),
         );
         let store = MemoryStore::new(&origin, expected.clone());
-        let client = Client::new(&origin)
+        let client = HttpTransport::new(&origin, None)
             .unwrap()
             .with_session(store.clone())
             .unwrap();
         let (status, code) =
             operation_status_and_code(client.invoke("catalog.find", &json!({})).unwrap_err());
-        assert_eq!(status, 401);
+        assert_eq!(status, Some(401));
         assert_eq!(
             code,
             if body.contains("invalid_token") {
@@ -753,7 +813,7 @@ fn stale_refresh_failure_preserves_new_login() {
                 &format!("old_refresh_{index}"),
             ),
         );
-        let client = Client::new(&origin)
+        let client = HttpTransport::new(&origin, None)
             .unwrap()
             .with_session(store.clone())
             .unwrap();
@@ -765,7 +825,10 @@ fn stale_refresh_failure_preserves_new_login() {
         let login = credentials("new_login", "new_login_refresh");
         *store.state.lock().unwrap() = Some(login.clone());
         release.send(()).unwrap();
-        assert!(call.join().unwrap().is_err());
+        let error = call.join().unwrap().unwrap_err();
+        assert_eq!(error.code, "internal");
+        assert_eq!(error.status, Some(if index == 0 { 401 } else { 200 }));
+        assert!(error.outcome_unknown);
         assert!(store.current() == login);
         assert_eq!(
             client.invoke("catalog.find", &json!({})).unwrap(),
@@ -787,20 +850,20 @@ fn reopened_store_cannot_reuse_an_uncertain_refresh_token() {
     ]);
     let initial = credentials("old_access", "old_refresh");
     let first_store = MemoryStore::new(&origin, initial.clone());
-    let first = Client::new(&origin)
+    let first = HttpTransport::new(&origin, None)
         .unwrap()
         .with_session(first_store)
         .unwrap();
     assert!(first.invoke("catalog.find", &json!({})).is_err());
     drop(first);
     let reopened = MemoryStore::new(&origin, initial);
-    let later = Client::new(&origin)
+    let later = HttpTransport::new(&origin, None)
         .unwrap()
         .with_session(reopened.clone())
         .unwrap();
     assert_eq!(
         operation_status_and_code(later.invoke("catalog.find", &json!({})).unwrap_err()),
-        (401, "invalid_token".into())
+        (None, "unauthenticated".into())
     );
     assert_eq!(receiver.recv().unwrap().path, "/catalog.find");
     assert_eq!(receiver.recv().unwrap().path, "/auth.refresh");
@@ -827,7 +890,7 @@ fn token_stays_blocked_until_store_persistence_is_confirmed() {
         save_barrier: Some((arrived, release.clone())),
         ..MemoryStore::default()
     });
-    let first = Client::new(&origin)
+    let first = HttpTransport::new(&origin, None)
         .unwrap()
         .with_session(store.clone())
         .unwrap();
@@ -838,10 +901,13 @@ fn token_stays_blocked_until_store_persistence_is_confirmed() {
         .recv_timeout(std::time::Duration::from_secs(5))
         .unwrap();
     let other = MemoryStore::new(&origin, initial);
-    let later = Client::new(&origin).unwrap().with_session(other).unwrap();
+    let later = HttpTransport::new(&origin, None)
+        .unwrap()
+        .with_session(other)
+        .unwrap();
     assert_eq!(
         operation_status_and_code(later.invoke("catalog.find", &json!({})).unwrap_err()),
-        (401, "invalid_token".into())
+        (None, "unauthenticated".into())
     );
     release.wait();
     assert_eq!(
@@ -885,14 +951,17 @@ fn store_errors_hide_tokens() {
     ]);
     let store = Arc::new(MemoryStore {
         origin: origin.clone(),
-        save_failure: Some(ClientError::Protocol(format!(
+        save_failure: Some(ClientError::local(format!(
             "storage failed: {}",
             initial.refresh_token
         ))),
         state: Mutex::new(Some(initial)),
         ..MemoryStore::default()
     });
-    let client = Client::new(&origin).unwrap().with_session(store).unwrap();
+    let client = HttpTransport::new(&origin, None)
+        .unwrap()
+        .with_session(store)
+        .unwrap();
     let error = client.invoke("catalog.find", &json!({})).unwrap_err();
     assert!(error.to_string() == "session refresh failed");
     assert_eq!(receiver.recv().unwrap().path, "/catalog.find");
@@ -948,7 +1017,10 @@ fn panicking_store_notifies_waiters(panic_refresh: bool) {
     });
     let (joined_sender, joined) = std::sync::mpsc::channel();
     client::observe_refresh_joins(&store, joined_sender);
-    let client = Client::new(&origin).unwrap().with_session(store).unwrap();
+    let client = HttpTransport::new(&origin, None)
+        .unwrap()
+        .with_session(store)
+        .unwrap();
     let (done, results) = std::sync::mpsc::channel();
     let spawn = |is_leader| {
         let client = client.clone();
@@ -980,12 +1052,12 @@ fn panicking_store_notifies_waiters(panic_refresh: bool) {
         let error = outcome.unwrap().expect_err("refresh must fail");
         if is_leader {
             assert!(
-                matches!(error, ClientError::Protocol(message) if message == "session refresh failed")
+                matches!(error, ClientError { message, .. } if message == "session refresh failed")
             );
         } else {
             assert_eq!(
                 operation_status_and_code(error),
-                (401, "invalid_token".into())
+                (None, "unauthenticated".into())
             );
         }
     }
@@ -999,7 +1071,7 @@ fn panicking_store_notifies_waiters(panic_refresh: bool) {
         .expect("later call must finish");
     assert_eq!(
         operation_status_and_code(outcome.unwrap().unwrap_err()),
-        (401, "invalid_token".into())
+        (None, "unauthenticated".into())
     );
     later.join().unwrap();
     let paths: Vec<_> = (0..replies.len())

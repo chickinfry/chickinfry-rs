@@ -5,7 +5,7 @@ use std::cell::Cell;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chickinfry::client::{Client, conformance};
+use chickinfry::client::{HttpTransport, conformance};
 use chickinfry_conformance_driver::protocol;
 
 #[path = "../../tests/common/mod.rs"]
@@ -149,8 +149,8 @@ fn reported_retention_matches_independent_live_and_peak_allocations() {
         assert_eq!(body.len(), length);
         let (origin, requests) =
             common::serve(&[common::response(&format!("HTTP/1.1 {status} Test"), &body)]);
-        let sdk = chickinfry_client_plain::Client::new(
-            Client::with_timeout(&origin, Duration::from_secs(5)).unwrap(),
+        let sdk = chickinfry_client_plain::create_client(
+            HttpTransport::new(&origin, Some(Duration::from_secs(5))).unwrap(),
         );
         let input = chickinfry_client_plain::client::ProbeEchoInput {
             wire_value: "ok".into(),

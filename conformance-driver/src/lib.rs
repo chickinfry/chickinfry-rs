@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use chickinfry::client::{Client, ClientError};
+#[cfg(test)]
+use chickinfry::client;
+use chickinfry::client::{ClientError, HttpTransport};
 use serde_json::{Value, json};
 
 use protocol::{Error, Message, Request, Response, Result};
@@ -45,7 +47,7 @@ enum Bridge {
 }
 
 struct Handle {
-    transport: Client,
+    transport: HttpTransport,
     #[cfg(feature = "conformance")]
     store: Option<Arc<Store>>,
     #[cfg(feature = "sdk")]
@@ -54,13 +56,13 @@ struct Handle {
 }
 
 impl Handle {
-    fn new(transport: Client, store: Option<Arc<Store>>, fixture: Fixture) -> Self {
+    fn new(transport: HttpTransport, store: Option<Arc<Store>>, fixture: Fixture) -> Self {
         let _ = &store;
         Self {
             #[cfg(feature = "sdk")]
             sdk: match fixture {
-                Fixture::Plain => Bridge::Plain(plain_sdk::Client::new(transport.clone())),
-                Fixture::Auth => Bridge::Auth(auth_sdk::Client::new(transport.clone())),
+                Fixture::Plain => Bridge::Plain(plain_sdk::create_client(transport.clone())),
+                Fixture::Auth => Bridge::Auth(auth_sdk::create_client(transport.clone())),
             },
             fixture,
             transport,
@@ -203,11 +205,11 @@ impl<W: Write + Send + 'static> State<W> {
                                 counter.fetch_add(1, Ordering::SeqCst);
                             }
                         }),
-                        || Client::with_timeout(origin, timeout),
+                        || HttpTransport::new(origin, Some(timeout)),
                     )
                 };
                 #[cfg(not(feature = "conformance"))]
-                let construction = Client::with_timeout(origin, timeout);
+                let construction = HttpTransport::new(origin, Some(timeout));
                 let count = network_requests.load(Ordering::SeqCst);
                 let mut transport = construction.map_err(|error| {
                     let mut error = sdk_error(error);
@@ -691,9 +693,7 @@ struct ObservationFailed;
 
 fn sdk_error(error: ClientError) -> Error {
     // Compare the actual public error in memory; never serialize exception text.
-    let raw_transport_details = match &error {
-        ClientError::Operation(_) => false,
-        ClientError::Protocol(message) => ![
+    let raw_transport_details = error.operation_error.is_none() && error.message != error.code && ![
             "operation timeout must be positive",
             "invalid access token",
             "invalid operation name",
@@ -708,28 +708,15 @@ fn sdk_error(error: ClientError) -> Error {
             "session refresh failed",
             "operation endpoint must be an HTTPS or loopback HTTP origin",
             "invalid refresh response",
-        ]
-        .contains(&message.as_str()),
-    };
-    let (code, status) = match error {
-        ClientError::Operation(e) => (Some(e.code), Some(e.status)),
-        ClientError::Protocol(message) => (
-            if matches!(
-                message.as_str(),
-                "invalid operation response field" | "invalid refresh response"
-            ) {
-                Some("invalid_response".into())
-            } else {
-                None
-            },
-            None,
-        ),
-    };
+        ].contains(&error.message.as_str());
+    let outcome_unknown = error.outcome_unknown;
+    let code = Some(error.code);
+    let status = error.status;
     Error {
         kind: "sdk".into(),
         code,
         http_status: status,
-        outcome_unknown: Some(false),
+        outcome_unknown: Some(outcome_unknown),
         raw_transport_details: Some(raw_transport_details),
         constructor_network_requests: None,
     }
@@ -818,9 +805,7 @@ fn typed_call(
         }
     }
     let _ = (handle, operation, input);
-    Err(ClientError::Protocol(
-        "fixture operation is unavailable".into(),
-    ))
+    Err(ClientError::new("unimplemented", None, false))
 }
 
 fn validate(request: &Request) -> Result<()> {
@@ -1018,7 +1003,7 @@ fn transport_error_allowlist_matches_runtime_messages() {
         "The response is too large. The operation may have completed; confirm its outcome before requesting less data.",
     ]) {
         let (origin, requests) = common::serve(&[reply]);
-        let client = Client::new(&origin).unwrap();
+        let client = HttpTransport::new(&origin, None).unwrap();
         let error = client.invoke("probe.echo", &json!({})).unwrap_err();
         error::assert_safe_protocol(&error, expected);
         assert_eq!(sdk_error(error).raw_transport_details, Some(false));
@@ -1027,7 +1012,7 @@ fn transport_error_allowlist_matches_runtime_messages() {
         assert!(request.authorization.is_none());
         assert_eq!(request.body, "{}");
     }
-    let client = Client::new("https://example.com").unwrap();
+    let client = HttpTransport::new("https://example.com", None).unwrap();
     let error = client
         .invoke("probe.echo", &json!({"value":"x".repeat(4 << 20)}))
         .unwrap_err();
@@ -1037,15 +1022,19 @@ fn transport_error_allowlist_matches_runtime_messages() {
     );
     assert_eq!(sdk_error(error).raw_transport_details, Some(false));
     assert_eq!(
-        sdk_error(ClientError::Protocol("synthetic-unlisted-marker".into())).raw_transport_details,
+        sdk_error(ClientError {
+            message: "synthetic-unlisted-marker".into(),
+            ..ClientError::new("unknown", None, false)
+        })
+        .raw_transport_details,
         Some(true)
     );
     // A safe message followed by extra text must not pass as safe; only exact matches are allowed.
     assert_eq!(
-        sdk_error(ClientError::Protocol(
-            "Could not read the response. Confirm the operation outcome before trying again. synthetic-suffix-marker"
-                .into()
-        ))
+        sdk_error(ClientError {
+            message: "Could not read the response. Confirm the operation outcome before trying again. synthetic-suffix-marker".into(),
+            ..ClientError::new("unavailable", Some(200), true)
+        })
         .raw_transport_details,
         Some(true)
     );
@@ -1085,7 +1074,7 @@ fn default_off_sdk_entry_and_refresh_have_no_observation_path() {
     store
         .write("record", "access", "refresh", Some(&origin))
         .unwrap();
-    let transport = Client::with_timeout(&origin, Duration::from_secs(1))
+    let transport = HttpTransport::new(&origin, Some(Duration::from_secs(1)))
         .unwrap()
         .with_session(store.clone())
         .unwrap();

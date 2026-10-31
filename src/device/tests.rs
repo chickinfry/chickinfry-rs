@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn persistence_selection_does_not_persist_request_bearers() {
-    let client = Client::new("https://example.com").unwrap();
+    let client = HttpTransport::new("https://example.com", None).unwrap();
     let disabled = client.with_persist(Persist::Disabled).unwrap();
     assert!(matches!(disabled.persist, Some(Persist::Disabled)));
     assert!(client.persist.is_none());
@@ -24,7 +24,7 @@ fn clones_share_the_bound_device_and_explicit_bearers_bypass_it() {
         .join(std::env::var_os("CARGO_TARGET_DIR").unwrap_or_else(|| "target".into()))
         .join("test-home")
         .join(format!("client-device-{}", std::process::id()));
-    let client = Client::new("https://example.com")
+    let client = HttpTransport::new("https://example.com", None)
         .unwrap()
         .with_persist(Persist::Dir(path.clone()))
         .unwrap();
@@ -54,8 +54,7 @@ fn clones_share_the_bound_device_and_explicit_bearers_bypass_it() {
         user_id: "00000000-0000-4000-8000-000000000001".into(),
         session_id: "00000000-0000-4000-8000-000000000002".into(),
     };
-    let custom =
-        Arc::new(MemorySessionStore::new("https://example.com", Some(credentials)).unwrap());
+    let custom = Arc::new(MemoryStore::new("https://example.com", Some(credentials)).unwrap());
     let custom_client = client.with_session(custom.clone()).unwrap();
     assert!(custom_client.session.is_some());
     assert!(matches!(custom_client.persist, Some(Persist::Disabled)));

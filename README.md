@@ -22,11 +22,11 @@ JSON request to `POST {origin}/{service.operation}`; origins must be HTTPS,
 or loopback HTTP for local development.
 
 ```rust
-use chickinfry::client::Client;
+use chickinfry::client::HttpTransport;
 
 fn main() -> Result<(), chickinfry::client::ClientError> {
     // The generated client builds its typed methods on this transport.
-    let transport = Client::new("https://your-project.chickinfry.app")?;
+    let transport = HttpTransport::new("https://your-project.chickinfry.app", None)?;
     let response = transport.invoke(
         "notes.list",
         &chickinfry::serde_json::json!({ "limit": 10 }),
@@ -45,7 +45,7 @@ protocol message, without underlying exception details, response bodies, or
 headers. Check your connection and confirm the operation outcome before trying
 again; the SDK does not automatically retry transport failures.
 
-`client::MemorySessionStore` keeps an optional session record for one origin in
+`client::MemoryStore` keeps an optional session record for one origin in
 memory. Its `clear(expected)` compares and deletes under the same lock, so a
 late rejection cannot remove a newer login. Custom `client::SessionStore`
 implementations must also make this comparison and deletion atomic.
@@ -60,8 +60,8 @@ current user: new directories use 0700 and files use 0600 on Unix; existing
 directories must be owned by the current user and not writable by others.
 Windows uses a current-user ACL. The files are not encrypted and do not use an OS keychain.
 
-`Client::with_persist(Persist::Disabled)` selects process memory, and
-`Client::with_persist(Persist::Dir(path))` selects a state directory. Relative paths are resolved once when the setting
+`HttpTransport::with_persist(Persist::Disabled)` selects process memory, and
+`HttpTransport::with_persist(Persist::Dir(path))` selects a state directory. Relative paths are resolved once when the setting
 is attached, so later changes to the working directory do not move stored state.
 Empty paths are rejected.
 Omitting the setting selects the platform state location. Explicit bearer

@@ -82,7 +82,7 @@ pub(crate) async fn call(request: HostRequest<'_>) -> Result<HostResponse, Strin
     let payload = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
     let value = wasm_bindgen_futures::JsFuture::from(db(payload))
         .await
-        .map_err(|error| format_host_rejection(error))?;
+        .map_err(format_host_rejection)?;
     let bytes = js_sys::Uint8Array::from(value).to_vec();
     serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }

@@ -162,7 +162,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
             .db
             .app_auth_users
             .find_many(FindMany {
-                filter: Some(Filter::eq(column, json!(email))),
+                r#where: Some(Filter::eq(column, json!(email))),
                 limit: Some(1),
                 ..Default::default()
             })
@@ -292,7 +292,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
             .db
             .app_auth_sessions
             .find_many(FindMany {
-                filter: Some(Filter::eq(
+                r#where: Some(Filter::eq(
                     self.db.app_auth_sessions.columns().token_hash,
                     json!(token_digest(token)),
                 )),
@@ -311,7 +311,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                         AppAuthSessionsPrimaryKey {
                             id: stored.id.clone(),
                         },
-                        Filter::all(vec![
+                        Filter::and(vec![
                             Filter::is_null(columns.revoked_at),
                             Filter::eq(columns.token_hash, json!(token_digest(token))),
                             Filter::eq(columns.transport, json!("native")),
@@ -328,14 +328,14 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                 let latest_refresh = tx
                     .app_auth_refresh_tokens
                     .find_many(FindMany {
-                        filter: Some(Filter::all(vec![
+                        r#where: Some(Filter::and(vec![
                             Filter::eq(
                                 tx.app_auth_refresh_tokens.columns().session_id,
                                 json!(session.id),
                             ),
                             Filter::is_null(tx.app_auth_refresh_tokens.columns().consumed_at),
                         ])),
-                        order: vec![Order {
+                        order_by: vec![Order {
                             column: tx.app_auth_refresh_tokens.columns().created_at,
                             direction: Direction::Descending,
                         }],
@@ -435,7 +435,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
             .db
             .app_auth_refresh_tokens
             .find_many(FindMany {
-                filter: Some(Filter::eq(
+                r#where: Some(Filter::eq(
                     self.db.app_auth_refresh_tokens.columns().token_hash,
                     json!(token_digest(token)),
                 )),
@@ -453,7 +453,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                         AppAuthSessionsPrimaryKey {
                             id: stored.session_id.clone(),
                         },
-                        Filter::all(vec![
+                        Filter::and(vec![
                             Filter::is_null(tx.app_auth_sessions.columns().revoked_at),
                             Filter::eq(tx.app_auth_sessions.columns().transport, json!("native")),
                         ]),
@@ -643,11 +643,11 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                 let mut candidates = tx
                     .app_auth_sessions
                     .find_many(FindMany {
-                        filter: Some(Filter::all(vec![
+                        r#where: Some(Filter::and(vec![
                             self.cleanup_candidates(tx, now)?,
-                            Filter::ge(id, json!(start)),
+                            Filter::gte(id, json!(start)),
                         ])),
-                        order: vec![Order {
+                        order_by: vec![Order {
                             column: id,
                             direction: Direction::Ascending,
                         }],
@@ -659,11 +659,11 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                     candidates.extend(
                         tx.app_auth_sessions
                             .find_many(FindMany {
-                                filter: Some(Filter::all(vec![
+                                r#where: Some(Filter::and(vec![
                                     self.cleanup_candidates(tx, now)?,
                                     Filter::lt(id, json!(start)),
                                 ])),
-                                order: vec![Order {
+                                order_by: vec![Order {
                                     column: id,
                                     direction: Direction::Ascending,
                                 }],
@@ -690,7 +690,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                         let latest = tx
                             .app_auth_refresh_tokens
                             .find_many(FindMany {
-                                filter: Some(Filter::all(vec![
+                                r#where: Some(Filter::and(vec![
                                     Filter::eq(
                                         tx.app_auth_refresh_tokens.columns().session_id,
                                         json!(session.id),
@@ -699,7 +699,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                                         tx.app_auth_refresh_tokens.columns().consumed_at,
                                     ),
                                 ])),
-                                order: vec![Order {
+                                order_by: vec![Order {
                                     column: tx.app_auth_refresh_tokens.columns().created_at,
                                     direction: Direction::Descending,
                                 }],
@@ -736,7 +736,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                     let refreshes = tx
                         .app_auth_refresh_tokens
                         .find_many(FindMany {
-                            filter: Some(Filter::eq(
+                            r#where: Some(Filter::eq(
                                 tx.app_auth_refresh_tokens.columns().session_id,
                                 json!(session.id),
                             )),
@@ -763,11 +763,11 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                 }
                 if remaining > 0 {
                     let columns = tx.app_auth_rate_limits.columns();
-                    let elapsed = Filter::le(columns.expires_at, json!(timestamp_at(now)?));
+                    let elapsed = Filter::lte(columns.expires_at, json!(timestamp_at(now)?));
                     let limits = tx
                         .app_auth_rate_limits
                         .find_many(FindMany {
-                            filter: Some(elapsed.clone()),
+                            r#where: Some(elapsed.clone()),
                             limit: Some(remaining),
                             ..Default::default()
                         })
@@ -811,14 +811,14 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
         let cutoff = json!(timestamp_at(now - self.session_policy.idle_millis)?);
         let mut filters = vec![
             Filter::is_not_null(columns.revoked_at),
-            Filter::le(columns.last_renewed_at, cutoff.clone()),
-            Filter::all(vec![
+            Filter::lte(columns.last_renewed_at, cutoff.clone()),
+            Filter::and(vec![
                 Filter::is_null(columns.last_renewed_at),
-                Filter::le(columns.expires_at, cutoff),
+                Filter::lte(columns.expires_at, cutoff),
             ]),
-            Filter::all(vec![
+            Filter::and(vec![
                 Filter::is_null(columns.last_renewed_at),
-                Filter::le(
+                Filter::lte(
                     columns.created_at,
                     json!(timestamp_at(now - LEGACY_REFRESH_LIFETIME_MILLIS)?),
                 ),
@@ -826,15 +826,15 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
         ];
         if self.session_policy.absolute_millis != 0 {
             let cutoff = json!(timestamp_at(now - self.session_policy.absolute_millis)?);
-            filters.push(Filter::le(columns.first_login_at, cutoff.clone()));
-            filters.push(Filter::all(vec![
+            filters.push(Filter::lte(columns.first_login_at, cutoff.clone()));
+            filters.push(Filter::and(vec![
                 Filter::is_null(columns.first_login_at),
-                Filter::le(columns.created_at, cutoff),
+                Filter::lte(columns.created_at, cutoff),
             ]));
         }
-        Ok(Filter::all(vec![
+        Ok(Filter::and(vec![
             Filter::eq(columns.transport, json!("native")),
-            Filter::any(filters),
+            Filter::or(filters),
         ]))
     }
 
@@ -885,7 +885,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                         action: action.into(),
                         key_hash: hash.clone(),
                     },
-                    Filter::all(vec![
+                    Filter::and(vec![
                         Filter::eq(columns.attempt_count, json!(row.attempt_count)),
                         Filter::eq(columns.expires_at, json!(row.expires_at)),
                     ]),

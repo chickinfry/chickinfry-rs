@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use chickinfry::client::{ClientError, MemorySessionStore, SessionCredentials, SessionStore};
+use chickinfry::client::{ClientError, MemoryStore, SessionCredentials, SessionStore};
 use serde_json::{Value, json};
 
 use crate::protocol::{self, Error, Result};
@@ -131,7 +131,7 @@ struct State {
 
 pub struct Store {
     state: Mutex<State>,
-    runtime: MemorySessionStore,
+    runtime: MemoryStore,
     origin: String,
     refs: Arc<Credentials>,
 }
@@ -158,8 +158,7 @@ impl Store {
                 revision: 1,
                 ..State::default()
             }),
-            runtime: MemorySessionStore::new(origin, None)
-                .map_err(|_| Error::driver("invalid_args"))?,
+            runtime: MemoryStore::new(origin, None).map_err(|_| Error::driver("invalid_args"))?,
             origin: origin.into(),
             refs,
         })

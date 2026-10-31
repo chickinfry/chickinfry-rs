@@ -1,6 +1,10 @@
 //! Focused transport checks for the shared client runtime: origin rules,
 //! wire envelope, bounds, redirect rejection, and error preservation.
 
+#[allow(
+    dead_code,
+    reason = "Each integration suite exercises a subset of the client module."
+)]
 #[path = "../src/client.rs"]
 mod client;
 
@@ -8,26 +12,21 @@ mod common;
 #[path = "common/error.rs"]
 mod error;
 
-use client::{Client, ClientError, OperationError};
+use client::{ClientError, HttpTransport, OperationError};
 use common::{response, serve, serve_with};
 use error::assert_safe_protocol;
 use serde_json::json;
 
 fn operation_error(error: ClientError) -> OperationError {
-    match error {
-        ClientError::Operation(error) => error,
-        other => panic!("expected operation error, got {other}"),
-    }
+    error
+        .operation_error
+        .expect("expected remote operation error")
 }
 
 fn protocol_message(error: ClientError) -> String {
-    if let ClientError::Protocol(message) = &error {
-        assert_safe_protocol(&error, message);
-    }
-    match error {
-        ClientError::Protocol(message) => message,
-        other => panic!("expected protocol error, got {other}"),
-    }
+    assert!(error.operation_error.is_none());
+    assert_safe_protocol(&error, &error.message);
+    error.message
 }
 
 #[test]
@@ -61,7 +60,7 @@ fn rejects_unsupported_origins() {
         "http://[::1]#",
     ] {
         assert!(
-            Client::new(origin).is_err(),
+            HttpTransport::new(origin, None).is_err(),
             "origin {origin} must be rejected"
         );
     }
@@ -81,7 +80,7 @@ fn accepts_https_and_loopback_http_origins() {
         "http://[::1]/",
     ] {
         assert!(
-            Client::new(origin).is_ok(),
+            HttpTransport::new(origin, None).is_ok(),
             "origin {origin} must be accepted"
         );
     }
@@ -89,7 +88,7 @@ fn accepts_https_and_loopback_http_origins() {
 
 #[test]
 fn rejects_invalid_operation_names_without_sending() {
-    let client = Client::new("https://example.com").expect("valid origin");
+    let client = HttpTransport::new("https://example.com", None).expect("valid origin");
     for operation in [
         "",
         "Service.Method",
@@ -105,7 +104,7 @@ fn rejects_invalid_operation_names_without_sending() {
 
 #[test]
 fn rejects_oversized_requests() {
-    let client = Client::new("https://example.com").expect("valid origin");
+    let client = HttpTransport::new("https://example.com", None).expect("valid origin");
     let oversized = "a".repeat(4 << 20);
     let message = protocol_message(
         client
@@ -124,8 +123,8 @@ fn rejects_oversized_responses() {
         "HTTP/1.1 200 OK",
         &format!("{{\"value\":\"{}\"}}", "a".repeat((1 << 20) + 16)),
     )]);
-    let client =
-        Client::with_timeout(&origin, std::time::Duration::from_secs(10)).expect("valid origin");
+    let client = HttpTransport::new(&origin, Some(std::time::Duration::from_secs(10)))
+        .expect("valid origin");
     let message = protocol_message(client.invoke("svc.op", &json!({})).unwrap_err());
     assert_eq!(
         message,
@@ -141,7 +140,7 @@ fn transport_failures_discard_underlying_details() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     drop(listener);
-    let client = Client::new(&origin).unwrap();
+    let client = HttpTransport::new(&origin, None).unwrap();
     assert_safe_protocol(&client.invoke("svc.op", &json!({})).unwrap_err(), expected);
 
     let (release, held) = std::sync::mpsc::channel();
@@ -149,14 +148,17 @@ fn transport_failures_discard_underlying_details() {
     let (origin, requests) = serve_with(&[response("HTTP/1.1 200 OK", "{}")], move |_| {
         held.lock().unwrap().recv().unwrap();
     });
-    let client = Client::with_timeout(&origin, std::time::Duration::from_millis(100)).unwrap();
+    let client = HttpTransport::new(&origin, Some(std::time::Duration::from_millis(100))).unwrap();
     let error = client.invoke("svc.op", &json!({})).unwrap_err();
     release.send(()).unwrap();
+    assert_eq!(error.code, "deadline_exceeded");
+    assert_eq!(error.status, None);
+    assert!(error.outcome_unknown);
     assert_safe_protocol(&error, expected);
     assert_eq!(requests.recv().unwrap().path, "/svc.op");
 
     let (origin, requests) = serve(&["INVALID synthetic-transport-marker\r\n\r\n".into()]);
-    let client = Client::new(&origin).unwrap();
+    let client = HttpTransport::new(&origin, None).unwrap();
     assert_safe_protocol(&client.invoke("svc.op", &json!({})).unwrap_err(), expected);
     assert_eq!(requests.recv().unwrap().path, "/svc.op");
 
@@ -166,10 +168,10 @@ fn transport_failures_discard_underlying_details() {
         use std::io::{Read, Write};
         let (mut stream, _) = listener.accept().unwrap();
         let mut hello = [0; 1024];
-        stream.read(&mut hello).unwrap();
+        assert!(stream.read(&mut hello).unwrap() > 0);
         let _ = stream.write_all(b"synthetic-tls-marker");
     });
-    let client = Client::with_timeout(&origin, std::time::Duration::from_secs(2)).unwrap();
+    let client = HttpTransport::new(&origin, Some(std::time::Duration::from_secs(2))).unwrap();
     assert_safe_protocol(&client.invoke("svc.op", &json!({})).unwrap_err(), expected);
     server.join().unwrap();
 }
@@ -178,12 +180,44 @@ fn transport_failures_discard_underlying_details() {
 fn truncated_response_discards_body_and_read_error() {
     let (origin, requests) = serve(&[response("HTTP/1.1 200 OK", "synthetic-body-marker")
         .replace("content-length: 21", "content-length: 100")]);
-    let client = Client::new(&origin).unwrap();
+    let client = HttpTransport::new(&origin, None).unwrap();
     assert_safe_protocol(
         &client.invoke("svc.op", &json!({})).unwrap_err(),
         "Could not read the response. Confirm the operation outcome before trying again.",
     );
     assert_eq!(requests.recv().unwrap().path, "/svc.op");
+}
+
+#[test]
+fn body_timeout_preserves_the_received_status() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let (release, blocked) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        blocked.recv().unwrap();
+    });
+    let client = HttpTransport::new(&origin, Some(std::time::Duration::from_millis(200))).unwrap();
+    let error = client.invoke("svc.op", &json!({})).unwrap_err();
+    release.send(()).unwrap();
+    server.join().unwrap();
+    assert_eq!(error.code, "deadline_exceeded");
+    assert_eq!(error.status, Some(200));
+    assert!(error.outcome_unknown);
+    assert_safe_protocol(
+        &error,
+        "Could not read the response. Confirm the operation outcome before trying again.",
+    );
 }
 
 #[test]
@@ -198,7 +232,7 @@ fn roundtrip_rejects_redirects_and_preserves_error_codes() {
         response("HTTP/1.1 400 Bad Request", "{\"error\":\"Bad Code!\"}"),
         response("HTTP/1.1 500 Internal Server Error", "not json"),
     ]);
-    let client = Client::with_timeout(&origin, std::time::Duration::from_secs(10))
+    let client = HttpTransport::new(&origin, Some(std::time::Duration::from_secs(10)))
         .expect("valid origin")
         .with_bearer(&"A".repeat(43))
         .expect("valid token");
@@ -215,26 +249,21 @@ fn roundtrip_rejects_redirects_and_preserves_error_codes() {
     );
     assert!(request.body.contains("\"id\":\"one\""));
 
-    let error = operation_error(client.invoke("catalog.find", &json!({})).unwrap_err());
-    assert_eq!(
-        (error.code.as_str(), error.status),
-        ("redirect_not_allowed", 302)
-    );
-
+    let error = client.invoke("catalog.find", &json!({})).unwrap_err();
+    assert_eq!((error.code.as_str(), error.status), ("internal", Some(302)));
+    assert!(error.operation_error.is_none());
+    assert!(error.outcome_unknown);
     let error = operation_error(client.invoke("catalog.find", &json!({})).unwrap_err());
     assert_eq!((error.code.as_str(), error.status), ("out_of_stock", 409));
-
-    let error = operation_error(client.invoke("catalog.find", &json!({})).unwrap_err());
-    assert_eq!(
-        (error.code.as_str(), error.status),
-        ("invalid_response", 400)
-    );
-
-    let error = operation_error(client.invoke("catalog.find", &json!({})).unwrap_err());
-    assert_eq!(
-        (error.code.as_str(), error.status),
-        ("invalid_response", 500)
-    );
+    for status in [400, 500] {
+        let error = client.invoke("catalog.find", &json!({})).unwrap_err();
+        assert_eq!(
+            (error.code.as_str(), error.status),
+            ("internal", Some(status))
+        );
+        assert!(error.operation_error.is_none());
+        assert!(error.outcome_unknown);
+    }
 }
 
 #[test]
@@ -253,21 +282,11 @@ fn invalid_error_envelopes_preserve_http_status() {
         r#"{"error":[]}"#,
     ] {
         let (origin, receiver) = serve(&[response("HTTP/1.1 503 Unavailable", body)]);
-        let client = Client::new(&origin).expect("valid origin");
+        let client = HttpTransport::new(&origin, None).expect("valid origin");
         let error = client.invoke("probe.echo", &json!({})).unwrap_err();
-        assert!(
-            error.to_string()
-                == "operation failed (invalid_response, HTTP 503). Contact the application maintainer."
-        );
-        assert!(
-            format!("{error:?}")
-                == "Operation(OperationError { code: \"invalid_response\", status: 503 })"
-        );
-        let error = operation_error(error);
-        assert_eq!(
-            (error.code.as_str(), error.status),
-            ("invalid_response", 503)
-        );
+        assert_eq!((error.code.as_str(), error.status), ("internal", Some(503)));
+        assert!(error.operation_error.is_none());
+        assert!(error.outcome_unknown);
         assert_eq!(receiver.recv().expect("request").path, "/probe.echo");
     }
 }
@@ -300,7 +319,11 @@ fn encode_and_decode_enforce_declared_field_types() {
         json!({ "id": "one", "count": null }),
         json!({ "id": "one", "count": "3" }),
     ] {
-        let message = protocol_message(client::decode_output::<Output>(broken).unwrap_err());
+        let error = client::decode_output::<Output>(broken).unwrap_err();
+        assert_eq!(error.code, "internal");
+        assert_eq!(error.status, None);
+        assert!(error.outcome_unknown);
+        let message = protocol_message(error);
         assert_eq!(message, "invalid operation response field");
     }
 }

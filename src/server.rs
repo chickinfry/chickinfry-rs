@@ -262,9 +262,48 @@ struct ResponseEnvelope {
 }
 
 fn error_envelope(status: u16, code: &str) -> ResponseEnvelope {
+    let valid = (400..=599).contains(&status)
+        && !code.is_empty()
+        && code.len() <= 64
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'_');
+    let (status, code) = if valid {
+        (status, code)
+    } else {
+        (500, "operation_failed")
+    };
     ResponseEnvelope {
         status,
         body: serde_json::json!({ "error": code }),
+    }
+}
+
+#[cfg(test)]
+mod public_error_tests {
+    use super::*;
+
+    #[test]
+    fn error_output_validates_mutable_public_members() {
+        for (status, code) in [
+            (399, "custom"),
+            (600, "custom"),
+            (200, "custom"),
+            (400, "Bad Code"),
+            (500, ""),
+        ] {
+            let response = error_envelope(status, code);
+            assert_eq!(response.status, 500);
+            assert_eq!(
+                response.body,
+                serde_json::json!({"error": "operation_failed"})
+            );
+        }
+        for status in [400, 599] {
+            let response = error_envelope(status, "custom");
+            assert_eq!(response.status, status);
+            assert_eq!(response.body, serde_json::json!({"error": "custom"}));
+        }
     }
 }
 
