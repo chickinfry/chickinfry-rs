@@ -73,6 +73,7 @@ dependencies = [
  "hex",
  "js-sys",
  "libc",
+ "log",
  "scrypt",
  "serde",
  "serde_json",
