@@ -71,6 +71,13 @@ pub struct AppAuthActionTokensUpdate {
     pub user_id: Option<String>,
 }
 
+#[derive(Debug, Default, chickinfry::serde::Serialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthActionTokensIncrement {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<i32>,
+}
+
 #[derive(Debug, chickinfry::serde::Deserialize, chickinfry::serde::Serialize)]
 #[serde(crate = "chickinfry::serde")]
 pub struct AppAuthActionTokensPrimaryKey {
@@ -118,6 +125,30 @@ impl AppAuthActionTokensRepository {
         let value = chickinfry::serde_json::to_value(&key)
             .map_err(|_| OperationError::internal())?;
         self.0.find_by_id(&value).await
+    }
+
+    pub async fn upsert(&self, insert: AppAuthActionTokensInsert) -> Result<AppAuthActionTokensRow, OperationError> {
+        let value = chickinfry::serde_json::to_value(&insert)
+            .map_err(|_| OperationError::internal())?;
+        self.0.upsert(&value).await
+    }
+
+    pub async fn increment(&self, key: AppAuthActionTokensPrimaryKey, columns: AppAuthActionTokensIncrement) -> Result<AppAuthActionTokensRow, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let columns = chickinfry::serde_json::to_value(&columns)
+            .map_err(|_| OperationError::internal())?;
+        self.0.increment(&key, &columns).await
+    }
+
+    pub async fn increment_if(&self, key: AppAuthActionTokensPrimaryKey, condition: chickinfry::orm::Filter, columns: AppAuthActionTokensIncrement, patch: AppAuthActionTokensUpdate) -> Result<Option<AppAuthActionTokensRow>, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let columns = chickinfry::serde_json::to_value(&columns)
+            .map_err(|_| OperationError::internal())?;
+        let patch = chickinfry::serde_json::to_value(&patch)
+            .map_err(|_| OperationError::internal())?;
+        self.0.increment_if(&key, &condition, &columns, &patch).await
     }
 
     pub async fn find_many(&self, options: FindMany) -> Result<Vec<AppAuthActionTokensRow>, OperationError> {
@@ -188,6 +219,11 @@ pub struct AppAuthIdentitiesUpdate {
     pub user_id: Option<String>,
 }
 
+#[derive(Debug, Default, chickinfry::serde::Serialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthIdentitiesIncrement {
+}
+
 #[derive(Debug, chickinfry::serde::Deserialize, chickinfry::serde::Serialize)]
 #[serde(crate = "chickinfry::serde")]
 pub struct AppAuthIdentitiesPrimaryKey {
@@ -228,6 +264,30 @@ impl AppAuthIdentitiesRepository {
         let value = chickinfry::serde_json::to_value(&key)
             .map_err(|_| OperationError::internal())?;
         self.0.find_by_id(&value).await
+    }
+
+    pub async fn upsert(&self, insert: AppAuthIdentitiesInsert) -> Result<AppAuthIdentitiesRow, OperationError> {
+        let value = chickinfry::serde_json::to_value(&insert)
+            .map_err(|_| OperationError::internal())?;
+        self.0.upsert(&value).await
+    }
+
+    pub async fn increment(&self, key: AppAuthIdentitiesPrimaryKey, columns: AppAuthIdentitiesIncrement) -> Result<AppAuthIdentitiesRow, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let columns = chickinfry::serde_json::to_value(&columns)
+            .map_err(|_| OperationError::internal())?;
+        self.0.increment(&key, &columns).await
+    }
+
+    pub async fn increment_if(&self, key: AppAuthIdentitiesPrimaryKey, condition: chickinfry::orm::Filter, columns: AppAuthIdentitiesIncrement, patch: AppAuthIdentitiesUpdate) -> Result<Option<AppAuthIdentitiesRow>, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let columns = chickinfry::serde_json::to_value(&columns)
+            .map_err(|_| OperationError::internal())?;
+        let patch = chickinfry::serde_json::to_value(&patch)
+            .map_err(|_| OperationError::internal())?;
+        self.0.increment_if(&key, &condition, &columns, &patch).await
     }
 
     pub async fn find_many(&self, options: FindMany) -> Result<Vec<AppAuthIdentitiesRow>, OperationError> {
@@ -329,6 +389,11 @@ pub struct AppAuthInvitesUpdate {
     pub revoked_at: Option<Option<String>>,
 }
 
+#[derive(Debug, Default, chickinfry::serde::Serialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthInvitesIncrement {
+}
+
 #[derive(Debug, chickinfry::serde::Deserialize, chickinfry::serde::Serialize)]
 #[serde(crate = "chickinfry::serde")]
 pub struct AppAuthInvitesPrimaryKey {
@@ -378,6 +443,30 @@ impl AppAuthInvitesRepository {
         let value = chickinfry::serde_json::to_value(&key)
             .map_err(|_| OperationError::internal())?;
         self.0.find_by_id(&value).await
+    }
+
+    pub async fn upsert(&self, insert: AppAuthInvitesInsert) -> Result<AppAuthInvitesRow, OperationError> {
+        let value = chickinfry::serde_json::to_value(&insert)
+            .map_err(|_| OperationError::internal())?;
+        self.0.upsert(&value).await
+    }
+
+    pub async fn increment(&self, key: AppAuthInvitesPrimaryKey, columns: AppAuthInvitesIncrement) -> Result<AppAuthInvitesRow, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let columns = chickinfry::serde_json::to_value(&columns)
+            .map_err(|_| OperationError::internal())?;
+        self.0.increment(&key, &columns).await
+    }
+
+    pub async fn increment_if(&self, key: AppAuthInvitesPrimaryKey, condition: chickinfry::orm::Filter, columns: AppAuthInvitesIncrement, patch: AppAuthInvitesUpdate) -> Result<Option<AppAuthInvitesRow>, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let columns = chickinfry::serde_json::to_value(&columns)
+            .map_err(|_| OperationError::internal())?;
+        let patch = chickinfry::serde_json::to_value(&patch)
+            .map_err(|_| OperationError::internal())?;
+        self.0.increment_if(&key, &condition, &columns, &patch).await
     }
 
     pub async fn find_many(&self, options: FindMany) -> Result<Vec<AppAuthInvitesRow>, OperationError> {
@@ -458,6 +547,11 @@ pub struct AppAuthMigrationsUpdate {
     pub phase: Option<String>,
 }
 
+#[derive(Debug, Default, chickinfry::serde::Serialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthMigrationsIncrement {
+}
+
 #[derive(Debug, chickinfry::serde::Deserialize, chickinfry::serde::Serialize)]
 #[serde(crate = "chickinfry::serde")]
 pub struct AppAuthMigrationsPrimaryKey {
@@ -502,6 +596,30 @@ impl AppAuthMigrationsRepository {
         let value = chickinfry::serde_json::to_value(&key)
             .map_err(|_| OperationError::internal())?;
         self.0.find_by_id(&value).await
+    }
+
+    pub async fn upsert(&self, insert: AppAuthMigrationsInsert) -> Result<AppAuthMigrationsRow, OperationError> {
+        let value = chickinfry::serde_json::to_value(&insert)
+            .map_err(|_| OperationError::internal())?;
+        self.0.upsert(&value).await
+    }
+
+    pub async fn increment(&self, key: AppAuthMigrationsPrimaryKey, columns: AppAuthMigrationsIncrement) -> Result<AppAuthMigrationsRow, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let columns = chickinfry::serde_json::to_value(&columns)
+            .map_err(|_| OperationError::internal())?;
+        self.0.increment(&key, &columns).await
+    }
+
+    pub async fn increment_if(&self, key: AppAuthMigrationsPrimaryKey, condition: chickinfry::orm::Filter, columns: AppAuthMigrationsIncrement, patch: AppAuthMigrationsUpdate) -> Result<Option<AppAuthMigrationsRow>, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let columns = chickinfry::serde_json::to_value(&columns)
+            .map_err(|_| OperationError::internal())?;
+        let patch = chickinfry::serde_json::to_value(&patch)
+            .map_err(|_| OperationError::internal())?;
+        self.0.increment_if(&key, &condition, &columns, &patch).await
     }
 
     pub async fn find_many(&self, options: FindMany) -> Result<Vec<AppAuthMigrationsRow>, OperationError> {
@@ -571,6 +689,13 @@ pub struct AppAuthRateLimitsUpdate {
     pub expires_at: Option<String>,
 }
 
+#[derive(Debug, Default, chickinfry::serde::Serialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthRateLimitsIncrement {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_count: Option<i32>,
+}
+
 #[derive(Debug, chickinfry::serde::Deserialize, chickinfry::serde::Serialize)]
 #[serde(crate = "chickinfry::serde")]
 pub struct AppAuthRateLimitsPrimaryKey {
@@ -611,6 +736,30 @@ impl AppAuthRateLimitsRepository {
         let value = chickinfry::serde_json::to_value(&key)
             .map_err(|_| OperationError::internal())?;
         self.0.find_by_id(&value).await
+    }
+
+    pub async fn upsert(&self, insert: AppAuthRateLimitsInsert) -> Result<AppAuthRateLimitsRow, OperationError> {
+        let value = chickinfry::serde_json::to_value(&insert)
+            .map_err(|_| OperationError::internal())?;
+        self.0.upsert(&value).await
+    }
+
+    pub async fn increment(&self, key: AppAuthRateLimitsPrimaryKey, columns: AppAuthRateLimitsIncrement) -> Result<AppAuthRateLimitsRow, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let columns = chickinfry::serde_json::to_value(&columns)
+            .map_err(|_| OperationError::internal())?;
+        self.0.increment(&key, &columns).await
+    }
+
+    pub async fn increment_if(&self, key: AppAuthRateLimitsPrimaryKey, condition: chickinfry::orm::Filter, columns: AppAuthRateLimitsIncrement, patch: AppAuthRateLimitsUpdate) -> Result<Option<AppAuthRateLimitsRow>, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let columns = chickinfry::serde_json::to_value(&columns)
+            .map_err(|_| OperationError::internal())?;
+        let patch = chickinfry::serde_json::to_value(&patch)
+            .map_err(|_| OperationError::internal())?;
+        self.0.increment_if(&key, &condition, &columns, &patch).await
     }
 
     pub async fn find_many(&self, options: FindMany) -> Result<Vec<AppAuthRateLimitsRow>, OperationError> {
@@ -695,6 +844,11 @@ pub struct AppAuthRefreshTokensUpdate {
     pub token_hash: Option<String>,
 }
 
+#[derive(Debug, Default, chickinfry::serde::Serialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthRefreshTokensIncrement {
+}
+
 #[derive(Debug, chickinfry::serde::Deserialize, chickinfry::serde::Serialize)]
 #[serde(crate = "chickinfry::serde")]
 pub struct AppAuthRefreshTokensPrimaryKey {
@@ -738,6 +892,30 @@ impl AppAuthRefreshTokensRepository {
         let value = chickinfry::serde_json::to_value(&key)
             .map_err(|_| OperationError::internal())?;
         self.0.find_by_id(&value).await
+    }
+
+    pub async fn upsert(&self, insert: AppAuthRefreshTokensInsert) -> Result<AppAuthRefreshTokensRow, OperationError> {
+        let value = chickinfry::serde_json::to_value(&insert)
+            .map_err(|_| OperationError::internal())?;
+        self.0.upsert(&value).await
+    }
+
+    pub async fn increment(&self, key: AppAuthRefreshTokensPrimaryKey, columns: AppAuthRefreshTokensIncrement) -> Result<AppAuthRefreshTokensRow, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let columns = chickinfry::serde_json::to_value(&columns)
+            .map_err(|_| OperationError::internal())?;
+        self.0.increment(&key, &columns).await
+    }
+
+    pub async fn increment_if(&self, key: AppAuthRefreshTokensPrimaryKey, condition: chickinfry::orm::Filter, columns: AppAuthRefreshTokensIncrement, patch: AppAuthRefreshTokensUpdate) -> Result<Option<AppAuthRefreshTokensRow>, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let columns = chickinfry::serde_json::to_value(&columns)
+            .map_err(|_| OperationError::internal())?;
+        let patch = chickinfry::serde_json::to_value(&patch)
+            .map_err(|_| OperationError::internal())?;
+        self.0.increment_if(&key, &condition, &columns, &patch).await
     }
 
     pub async fn find_many(&self, options: FindMany) -> Result<Vec<AppAuthRefreshTokensRow>, OperationError> {
@@ -845,6 +1023,13 @@ pub struct AppAuthSessionsUpdate {
     pub user_session_version: Option<i32>,
 }
 
+#[derive(Debug, Default, chickinfry::serde::Serialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthSessionsIncrement {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_session_version: Option<i32>,
+}
+
 #[derive(Debug, chickinfry::serde::Deserialize, chickinfry::serde::Serialize)]
 #[serde(crate = "chickinfry::serde")]
 pub struct AppAuthSessionsPrimaryKey {
@@ -896,6 +1081,30 @@ impl AppAuthSessionsRepository {
         let value = chickinfry::serde_json::to_value(&key)
             .map_err(|_| OperationError::internal())?;
         self.0.find_by_id(&value).await
+    }
+
+    pub async fn upsert(&self, insert: AppAuthSessionsInsert) -> Result<AppAuthSessionsRow, OperationError> {
+        let value = chickinfry::serde_json::to_value(&insert)
+            .map_err(|_| OperationError::internal())?;
+        self.0.upsert(&value).await
+    }
+
+    pub async fn increment(&self, key: AppAuthSessionsPrimaryKey, columns: AppAuthSessionsIncrement) -> Result<AppAuthSessionsRow, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let columns = chickinfry::serde_json::to_value(&columns)
+            .map_err(|_| OperationError::internal())?;
+        self.0.increment(&key, &columns).await
+    }
+
+    pub async fn increment_if(&self, key: AppAuthSessionsPrimaryKey, condition: chickinfry::orm::Filter, columns: AppAuthSessionsIncrement, patch: AppAuthSessionsUpdate) -> Result<Option<AppAuthSessionsRow>, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let columns = chickinfry::serde_json::to_value(&columns)
+            .map_err(|_| OperationError::internal())?;
+        let patch = chickinfry::serde_json::to_value(&patch)
+            .map_err(|_| OperationError::internal())?;
+        self.0.increment_if(&key, &condition, &columns, &patch).await
     }
 
     pub async fn find_many(&self, options: FindMany) -> Result<Vec<AppAuthSessionsRow>, OperationError> {
@@ -1002,6 +1211,13 @@ pub struct AppAuthSignupRequestsUpdate {
     pub updated_at: Option<String>,
 }
 
+#[derive(Debug, Default, chickinfry::serde::Serialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthSignupRequestsIncrement {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<i32>,
+}
+
 #[derive(Debug, chickinfry::serde::Deserialize, chickinfry::serde::Serialize)]
 #[serde(crate = "chickinfry::serde")]
 pub struct AppAuthSignupRequestsPrimaryKey {
@@ -1053,6 +1269,30 @@ impl AppAuthSignupRequestsRepository {
         let value = chickinfry::serde_json::to_value(&key)
             .map_err(|_| OperationError::internal())?;
         self.0.find_by_id(&value).await
+    }
+
+    pub async fn upsert(&self, insert: AppAuthSignupRequestsInsert) -> Result<AppAuthSignupRequestsRow, OperationError> {
+        let value = chickinfry::serde_json::to_value(&insert)
+            .map_err(|_| OperationError::internal())?;
+        self.0.upsert(&value).await
+    }
+
+    pub async fn increment(&self, key: AppAuthSignupRequestsPrimaryKey, columns: AppAuthSignupRequestsIncrement) -> Result<AppAuthSignupRequestsRow, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let columns = chickinfry::serde_json::to_value(&columns)
+            .map_err(|_| OperationError::internal())?;
+        self.0.increment(&key, &columns).await
+    }
+
+    pub async fn increment_if(&self, key: AppAuthSignupRequestsPrimaryKey, condition: chickinfry::orm::Filter, columns: AppAuthSignupRequestsIncrement, patch: AppAuthSignupRequestsUpdate) -> Result<Option<AppAuthSignupRequestsRow>, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let columns = chickinfry::serde_json::to_value(&columns)
+            .map_err(|_| OperationError::internal())?;
+        let patch = chickinfry::serde_json::to_value(&patch)
+            .map_err(|_| OperationError::internal())?;
+        self.0.increment_if(&key, &condition, &columns, &patch).await
     }
 
     pub async fn find_many(&self, options: FindMany) -> Result<Vec<AppAuthSignupRequestsRow>, OperationError> {
@@ -1145,6 +1385,13 @@ pub struct AppAuthUsersUpdate {
     pub session_version: Option<i32>,
 }
 
+#[derive(Debug, Default, chickinfry::serde::Serialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthUsersIncrement {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_version: Option<i32>,
+}
+
 #[derive(Debug, chickinfry::serde::Deserialize, chickinfry::serde::Serialize)]
 #[serde(crate = "chickinfry::serde")]
 pub struct AppAuthUsersPrimaryKey {
@@ -1190,6 +1437,30 @@ impl AppAuthUsersRepository {
         let value = chickinfry::serde_json::to_value(&key)
             .map_err(|_| OperationError::internal())?;
         self.0.find_by_id(&value).await
+    }
+
+    pub async fn upsert(&self, insert: AppAuthUsersInsert) -> Result<AppAuthUsersRow, OperationError> {
+        let value = chickinfry::serde_json::to_value(&insert)
+            .map_err(|_| OperationError::internal())?;
+        self.0.upsert(&value).await
+    }
+
+    pub async fn increment(&self, key: AppAuthUsersPrimaryKey, columns: AppAuthUsersIncrement) -> Result<AppAuthUsersRow, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let columns = chickinfry::serde_json::to_value(&columns)
+            .map_err(|_| OperationError::internal())?;
+        self.0.increment(&key, &columns).await
+    }
+
+    pub async fn increment_if(&self, key: AppAuthUsersPrimaryKey, condition: chickinfry::orm::Filter, columns: AppAuthUsersIncrement, patch: AppAuthUsersUpdate) -> Result<Option<AppAuthUsersRow>, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let columns = chickinfry::serde_json::to_value(&columns)
+            .map_err(|_| OperationError::internal())?;
+        let patch = chickinfry::serde_json::to_value(&patch)
+            .map_err(|_| OperationError::internal())?;
+        self.0.increment_if(&key, &condition, &columns, &patch).await
     }
 
     pub async fn find_many(&self, options: FindMany) -> Result<Vec<AppAuthUsersRow>, OperationError> {
