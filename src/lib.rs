@@ -24,6 +24,7 @@ pub mod auth;
 pub mod client;
 pub mod database;
 pub mod host;
+mod logging;
 pub mod orm;
 pub mod server;
 

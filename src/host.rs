@@ -9,6 +9,8 @@ use wasm_bindgen::prelude::wasm_bindgen;
 unsafe extern "C" {
     #[wasm_bindgen(js_namespace = __chik)]
     pub safe fn db(request: Vec<u8>) -> js_sys::Promise;
+    #[wasm_bindgen(catch, js_namespace = __chik, js_name = log)]
+    safe fn host_log(request: Vec<u8>) -> Result<js_sys::Promise, wasm_bindgen::JsValue>;
 }
 
 #[derive(serde::Serialize)]
@@ -153,4 +155,15 @@ pub(crate) mod testing {
             }
         }
     }
+}
+
+#[cfg(not(all(test, not(target_arch = "wasm32"))))]
+pub(crate) fn start_log(frame: Vec<u8>) -> Option<js_sys::Promise> {
+    host_log(frame).ok()
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn start_log(frame: Vec<u8>) -> Option<js_sys::Promise> {
+    let _ = testing::respond(serde_json::from_slice(&frame).unwrap());
+    None
 }

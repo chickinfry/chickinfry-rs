@@ -16,6 +16,7 @@ conformance = []
 
 [dependencies]
 js-sys = "0.3"
+log = "0.4"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 getrandom = { version = "0.2", features = ["js"] }

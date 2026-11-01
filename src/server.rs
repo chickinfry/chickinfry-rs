@@ -384,6 +384,16 @@ async fn serve_inner<A: Application>(
     let rid = parsed
         .id
         .unwrap_or_else(|| NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed));
+    crate::logging::scope(rid, serve_request(application, parsed, body, config, rid)).await
+}
+
+async fn serve_request<A: Application>(
+    application: &A,
+    parsed: RequestMetadata,
+    body: Vec<u8>,
+    config: &crate::RuntimeConfig,
+    rid: u64,
+) -> Result<ResponseEnvelope, u16> {
     let origin = parsed
         .headers
         .iter()
