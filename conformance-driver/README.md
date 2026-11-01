@@ -160,4 +160,4 @@ Repeat clippy with default features off/on as above. The default-off test invoke
 the generated SDK, performs actual automatic refresh/retry, and inspects that
 debug test's symbols for the absence of runtime conformance observations.
 Standalone checks and incomplete coordinator results do not establish customer
-support; workerd, PostgreSQL and deployment require separate evidence.
+support; the server runtime, PostgreSQL and deployment require separate evidence.
