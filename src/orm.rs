@@ -5,6 +5,7 @@
 
 use crate::database::{DatabasePort, TransactionPort};
 use crate::server::OperationError;
+use chrono::{DateTime, Datelike, Utc};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -601,14 +602,12 @@ impl Repository {
                 .ok_or_else(OperationError::internal)?;
             if column.kind == Kind::Timestamp && !value.is_null() {
                 let text = value.as_str().ok_or_else(OperationError::internal)?;
-                let timestamp = chrono::DateTime::parse_from_rfc3339(text)
-                    .or_else(|_| chrono::DateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f%#z"))
-                    .map_err(|_| OperationError::internal())?;
-                *value = serde_json::Value::String(
-                    timestamp
-                        .to_utc()
-                        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
-                );
+                let timestamp = parse_timestamp(text, true)?;
+                let utc = timestamp.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+                let (whole, fraction) = utc.split_once('.').ok_or_else(OperationError::internal)?;
+                let micros = &fraction[..6];
+                let digits = micros.trim_end_matches('0').len().max(3);
+                *value = serde_json::Value::String(format!("{whole}.{}Z", &micros[..digits]));
             }
             encode_value(column, value, &mut Vec::new())?;
         }
@@ -702,6 +701,27 @@ fn join_filters(
     Ok(format!("({})", compiled.join(separator)))
 }
 
+fn parse_timestamp(text: &str, postgres: bool) -> Result<DateTime<Utc>, OperationError> {
+    if let Some((_, decimal)) = text.split_once('.')
+        && decimal.bytes().take_while(u8::is_ascii_digit).count() > 6
+    {
+        return Err(OperationError::internal());
+    }
+    let parsed = DateTime::parse_from_rfc3339(text).or_else(|error| {
+        if postgres {
+            DateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f%#z")
+        } else {
+            Err(error)
+        }
+    });
+    let timestamp = parsed.map_err(|_| OperationError::internal())?;
+    let utc = timestamp.to_utc();
+    if !(1..=9999).contains(&timestamp.year()) || !(1..=9999).contains(&utc.year()) {
+        return Err(OperationError::internal());
+    }
+    Ok(utc)
+}
+
 /// Encodes one logical value with its declared column kind. PostgreSQL receives
 /// dates and timestamps as strings so timezone moves and millisecond
 /// truncation cannot lose microseconds.
@@ -750,8 +770,7 @@ fn encode_value(
                     }
                 }
                 Kind::Timestamp => {
-                    chrono::DateTime::parse_from_rfc3339(text)
-                        .map_err(|_| OperationError::internal())?;
+                    parse_timestamp(text, false)?;
                 }
                 _ => {}
             }
@@ -796,6 +815,34 @@ mod tests {
             Column::new("name", Kind::Text, false, false, false, ""),
         ],
     );
+
+    #[test]
+    fn orm_preserves_microseconds_without_extra_fraction_digits() {
+        static DATES: TableDefinition = TableDefinition::new(
+            "dates",
+            &["id"],
+            &[Column::new(
+                "seen_at",
+                Kind::Timestamp,
+                false,
+                false,
+                false,
+                "",
+            )],
+        );
+        let repository = Repository::new(&DATES, DatabasePort::new(1));
+        let row = json!({"seen_at": "2026-01-02 12:04:05.123450+09"});
+        let decoded: Value = repository
+            .decode_row(row.as_object().unwrap().clone())
+            .ok()
+            .unwrap();
+        assert_eq!(decoded["seen_at"], "2026-01-02T03:04:05.12345Z");
+        for invalid in ["2026-01-02T03:04:05.1234560Z", "0000-01-01T00:00:00Z"] {
+            let mut params = Vec::new();
+            assert!(encode_value(&DATES.columns[0], &json!(invalid), &mut params).is_err());
+            assert!(params.is_empty());
+        }
+    }
 
     #[test]
     fn null_comparisons_require_null_predicates() {
