@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
 use base64::Engine;
-use client::{ClientError, HttpTransport, SessionCredentials, SessionStore};
+use client::{ClientError, HttpTransport, SessionCredentials, SessionStore, Transport};
 use common::{response, serve, serve_with};
 use error::assert_safe_protocol;
 use serde_json::json;
@@ -142,6 +142,167 @@ fn unwrap_credentials(store: &MemoryStore) -> SessionCredentials {
         .expect("store state")
         .clone()
         .expect("credentials present")
+}
+
+#[test]
+fn signed_out_client_relogs_in_and_sends_only_allowed_calls() {
+    let response_ok = response("HTTP/1.1 200 OK", r#"{"ok":true}"#);
+    let logout_reply = response("HTTP/1.1 200 OK", r#"{"status":"ok"}"#);
+    let new_login = json!({
+        "access_token": token("next_access"), "refresh_token": token("next_refresh"),
+        "expires_at": "2026-01-01T00:00:00Z", "refresh_expires_at": "2026-01-02T00:00:00Z",
+        "user_id": "user-1", "session_id": "session-2",
+    });
+    let (origin, requests) = serve(&[
+        response(
+            "HTTP/1.1 200 OK",
+            r#"{"accepted":true,"attempt":"pending"}"#,
+        ),
+        response("HTTP/1.1 200 OK", &refresh_body("access", "refresh")),
+        logout_reply.clone(),
+        response("HTTP/1.1 200 OK", &new_login.to_string()),
+        response_ok.clone(),
+        response_ok.clone(),
+        logout_reply,
+        response_ok,
+    ]);
+    let store = Arc::new(client::MemoryStore::new(&origin, None).unwrap());
+    let client: Arc<dyn Transport> = Arc::new(
+        HttpTransport::new(&origin, None)
+            .unwrap()
+            .with_session(store.clone())
+            .unwrap(),
+    );
+
+    let input = json!({});
+    client.invoke_public("auth.signup", &input).unwrap();
+    assert!(store.read().is_none());
+    client.invoke_public("auth.signin", &input).unwrap();
+    client.invoke("auth.logout", &input).unwrap();
+    assert!(store.read().is_none());
+    client.invoke_public("auth.signin", &input).unwrap();
+    client.invoke("catalog.find", &input).unwrap();
+    client.invoke_public("catalog.list", &input).unwrap();
+    client.invoke("auth.logout", &input).unwrap();
+    assert!(store.read().is_none());
+    client.invoke_public("catalog.list", &input).unwrap();
+    let error = client.invoke("catalog.find", &input).unwrap_err();
+    assert_eq!(
+        operation_status_and_code(error),
+        (None, "unauthenticated".into())
+    );
+
+    for (path, bearer) in [
+        ("/auth.signup", None),
+        ("/auth.signin", None),
+        ("/auth.logout", Some("access")),
+        ("/auth.signin", None),
+        ("/catalog.find", Some("next_access")),
+        ("/catalog.list", Some("next_access")),
+        ("/auth.logout", Some("next_access")),
+        ("/catalog.list", None),
+    ] {
+        let request = requests.recv().unwrap();
+        assert_eq!(request.path, path);
+        assert_eq!(
+            request.authorization,
+            bearer.map(|seed| format!("Bearer {}", token(seed)))
+        );
+    }
+    assert!(requests.try_recv().is_err());
+}
+
+#[test]
+fn incomplete_store_record_is_not_an_empty_session() {
+    let (origin, requests) = serve(&[]);
+    let store = MemoryStore::new(&origin, credentials("access", "refresh"));
+    let client = HttpTransport::new(&origin, None)
+        .unwrap()
+        .with_session(store.clone())
+        .unwrap();
+    let mut invalid = empty_credentials();
+    invalid.refresh_token = token("malformed_access");
+    *store.state.lock().unwrap() = Some(invalid);
+
+    let error = client.invoke_public("auth.signin", &json!({})).unwrap_err();
+    assert_eq!(
+        operation_status_and_code(error),
+        (None, "invalid_argument".into())
+    );
+    assert!(requests.try_recv().is_err());
+}
+
+#[test]
+fn late_logout_does_not_clear_a_new_session() {
+    let (arrived, arrival) = std::sync::mpsc::channel();
+    let (release, held) = std::sync::mpsc::channel();
+    let held = Mutex::new(held);
+    let (origin, _requests) = serve_with(
+        &[response("HTTP/1.1 200 OK", r#"{"status":"ok"}"#)],
+        move |_| {
+            arrived.send(()).unwrap();
+            held.lock().unwrap().recv().unwrap();
+        },
+    );
+    let old = credentials("old_access", "old_refresh");
+    let store = Arc::new(client::MemoryStore::new(&origin, Some(old)).unwrap());
+    let client = HttpTransport::new(&origin, None)
+        .unwrap()
+        .with_session(store.clone())
+        .unwrap();
+    let logout = std::thread::spawn(move || client.invoke("auth.logout", &json!({})));
+    arrival
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+
+    let mut next = credentials("next_access", "next_refresh");
+    next.session_id = "session-2".into();
+    store.write(next.clone()).unwrap();
+    release.send(()).unwrap();
+
+    logout.join().unwrap().unwrap();
+    assert_eq!(store.read(), Some(next));
+}
+
+#[test]
+fn account_change_does_not_replay_an_in_flight_body() {
+    let (arrived, arrival) = std::sync::mpsc::channel();
+    let (release, held) = std::sync::mpsc::channel();
+    let held = Mutex::new(held);
+    let (origin, requests) = serve_with(
+        &[
+            response("HTTP/1.1 401 Unauthorized", r#"{"error":"invalid_token"}"#),
+            response("HTTP/1.1 200 OK", r#"{"ok":true}"#),
+        ],
+        move |index| {
+            if index == 0 {
+                arrived.send(()).unwrap();
+                held.lock().unwrap().recv().unwrap();
+            }
+        },
+    );
+    let old = credentials("old_access", "old_refresh");
+    let store = Arc::new(client::MemoryStore::new(&origin, Some(old.clone())).unwrap());
+    let client = HttpTransport::new(&origin, None)
+        .unwrap()
+        .with_session(store.clone())
+        .unwrap();
+    let call = std::thread::spawn(move || client.invoke("catalog.find", &json!({"id":"old"})));
+    arrival
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    assert!(store.clear(&old));
+    let mut next = credentials("next_access", "next_refresh");
+    next.session_id = "session-2".into();
+    store.write(next).unwrap();
+    release.send(()).unwrap();
+    let error = call.join().unwrap().unwrap_err();
+    assert_eq!(
+        operation_status_and_code(error),
+        (None, "unauthenticated".into())
+    );
+    assert_eq!(requests.recv().unwrap().path, "/catalog.find");
+    assert!(requests.try_recv().is_err());
 }
 
 #[test]

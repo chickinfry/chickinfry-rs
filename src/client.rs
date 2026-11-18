@@ -180,11 +180,21 @@ impl std::error::Error for OperationError {}
 /// Replaceable operation transport shared by generated service clients.
 pub trait Transport: Send + Sync {
     fn invoke(&self, operation: &str, input: &Value) -> Result<Value, ClientError>;
+
+    /// Invokes an operation that permits a request without a session.
+    #[doc(hidden)]
+    fn invoke_public(&self, operation: &str, input: &Value) -> Result<Value, ClientError> {
+        self.invoke(operation, input)
+    }
 }
 
 impl Transport for HttpTransport {
     fn invoke(&self, operation: &str, input: &Value) -> Result<Value, ClientError> {
         HttpTransport::invoke(self, operation, input)
+    }
+
+    fn invoke_public(&self, operation: &str, input: &Value) -> Result<Value, ClientError> {
+        self.invoke_operation(operation, input, true)
     }
 }
 
@@ -197,6 +207,39 @@ pub struct SessionCredentials {
     pub refresh_expires_at: String,
     pub user_id: String,
     pub session_id: String,
+}
+
+impl SessionCredentials {
+    fn empty() -> Self {
+        Self {
+            access_token: String::new(),
+            refresh_token: String::new(),
+            expires_at: String::new(),
+            refresh_expires_at: String::new(),
+            user_id: String::new(),
+            session_id: String::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.access_token.is_empty()
+            && self.refresh_token.is_empty()
+            && self.expires_at.is_empty()
+            && self.refresh_expires_at.is_empty()
+            && self.user_id.is_empty()
+            && self.session_id.is_empty()
+    }
+
+    fn require_same_session(&self, current: &Self) -> Result<(), ClientError> {
+        if self.user_id.is_empty()
+            || self.session_id.is_empty()
+            || self.user_id != current.user_id
+            || self.session_id != current.session_id
+        {
+            return Err(invalid_token_error());
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Debug for SessionCredentials {
@@ -220,10 +263,10 @@ pub trait SessionStore: Send + Sync + 'static {
     /// Returns the deployment origin these credentials are bound to. There is
     /// no default: a store that cannot name its origin cannot be attached.
     fn bound_origin(&self) -> String;
-    /// Returns the currently stored credentials.
+    /// Returns the stored credentials, with every field empty for a signed-out store.
     fn credentials(&self) -> SessionCredentials;
-    /// Rotates credentials through `operation`; the store persists and returns
-    /// the credentials it accepted.
+    /// Updates credentials through `operation`; the store persists and returns
+    /// the credentials it accepted. A sign-in can supply an empty starting record.
     /// Custom stores must preserve concurrent replacement or deletion: compare
     /// the pre-refresh record and save atomically after the callback, without
     /// holding the storage lock during network activity.
@@ -293,26 +336,19 @@ impl SessionStore for MemoryStore {
         self.origin.clone()
     }
     fn credentials(&self) -> SessionCredentials {
-        self.read().unwrap_or_else(|| SessionCredentials {
-            access_token: String::new(),
-            refresh_token: String::new(),
-            expires_at: String::new(),
-            refresh_expires_at: String::new(),
-            user_id: String::new(),
-            session_id: String::new(),
-        })
+        self.read().unwrap_or_else(SessionCredentials::empty)
     }
     fn refresh(
         &self,
         operation: &mut dyn FnMut(SessionCredentials) -> Result<SessionCredentials, ClientError>,
     ) -> Result<SessionCredentials, ClientError> {
-        let expected = self.read().ok_or_else(session_refresh_failed)?;
-        let refreshed = operation(expected.clone())?;
+        let expected = self.read();
+        let refreshed = operation(expected.clone().unwrap_or_else(SessionCredentials::empty))?;
         if !valid_token(&refreshed.access_token) || !valid_token(&refreshed.refresh_token) {
             return Err(ClientError::local("invalid session credential".into()));
         }
         let mut current = self.credentials.lock().expect("session store");
-        if current.as_ref() != Some(&expected) {
+        if *current != expected {
             return Err(session_refresh_failed());
         }
         *current = Some(refreshed.clone());
@@ -391,7 +427,7 @@ impl HttpTransport {
         let credentials = store.credentials();
         self.guard_store_credentials(&store, &credentials)?;
         let mut copy = self.clone();
-        copy.bearer = Some(credentials.access_token);
+        copy.bearer = None;
         copy.session = Some(store);
         copy.persist = Some(Persist::Disabled);
         copy.device = Arc::new(Mutex::new(None));
@@ -469,6 +505,15 @@ impl HttpTransport {
 
     /// Invokes one declared operation and returns the JSON response value.
     pub fn invoke(&self, operation: &str, input: &Value) -> Result<Value, ClientError> {
+        self.invoke_operation(operation, input, false)
+    }
+
+    fn invoke_operation(
+        &self,
+        operation: &str,
+        input: &Value,
+        public: bool,
+    ) -> Result<Value, ClientError> {
         #[cfg(feature = "conformance")]
         conformance::emit(conformance::Event::Entered);
         let Some(store) = self.session.as_ref() else {
@@ -476,17 +521,19 @@ impl HttpTransport {
                 .invoke_once(operation, input, self.bearer.as_deref(), None)
                 .map(|(value, _)| value);
         };
-        let credentials = store.credentials();
+        let mut credentials = store.credentials();
         self.guard_store_credentials(store, &credentials)?;
-        let token = if operation == REFRESH_OPERATION {
-            None
-        } else {
-            Some(credentials.access_token.clone())
-        };
-        let result = self.invoke_once(operation, input, token.as_deref(), None);
-        match result {
+        let empty = credentials.is_empty();
+        if empty && !public {
+            return Err(invalid_token_error());
+        }
+        let token =
+            (!empty && operation != REFRESH_OPERATION).then_some(credentials.access_token.as_str());
+        let result = self.invoke_once(operation, input, token, None);
+        let (value, status) = match result {
             Err(error)
-                if operation != REFRESH_OPERATION
+                if !empty
+                    && operation != REFRESH_OPERATION
                     && error.operation_error.as_ref().is_some_and(|error| {
                         error.status == 401 && error.code == "invalid_token"
                     }) =>
@@ -495,22 +542,50 @@ impl HttpTransport {
                 conformance::emit(conformance::Event::OriginalRejected {
                     access_token: credentials.access_token.clone(),
                 });
-                let credentials = self.refresh_session(store, &credentials.access_token)?;
+                credentials = self.refresh_session(store, &credentials)?;
                 self.invoke_once(operation, input, Some(&credentials.access_token), None)
             }
             other => other,
+        }?;
+        if operation == "auth.logout" && value["status"].as_str() == Some("ok") {
+            store.clear(&credentials);
         }
-        .map(|(value, _)| value)
+        if public
+            && (operation == "auth.signin"
+                || operation == "auth.signup" && value.get("access_token").is_some())
+        {
+            let signed_in = read_credentials(&value, "invalid operation response field").map_err(
+                |mut error| {
+                    error.status = Some(status);
+                    error
+                },
+            )?;
+            let mut replaced = false;
+            let saved = store.refresh(&mut |current| {
+                if current != credentials {
+                    replaced = true;
+                    return Err(invalid_token_error());
+                }
+                Ok(signed_in.clone())
+            });
+            match saved {
+                Ok(saved) if saved == signed_in => {}
+                _ if replaced => return Err(invalid_token_error()),
+                _ => return Err(ClientError::new("failed_precondition", None, false)),
+            }
+        }
+        Ok(value)
     }
 
     fn refresh_session(
         &self,
         store: &Arc<dyn SessionStore>,
-        failed_access: &str,
+        original: &SessionCredentials,
     ) -> Result<SessionCredentials, ClientError> {
         let current = store.credentials();
         self.guard_store_credentials(store, &current)?;
-        if current.access_token != failed_access {
+        original.require_same_session(&current)?;
+        if current.access_token != original.access_token {
             return Ok(current);
         }
         let refresh_token = current.refresh_token.clone();
@@ -549,7 +624,7 @@ impl HttpTransport {
         if leader {
             let mut confirmed_rejection = false;
             let outcome = catch_unwind(AssertUnwindSafe(|| {
-                self.run_refresh(store, &current, failed_access, &mut confirmed_rejection)
+                self.run_refresh(store, &current, original, &mut confirmed_rejection)
             }))
             .unwrap_or_else(|_| Err(session_refresh_failed()));
             if outcome.is_err() && !confirmed_rejection {
@@ -568,6 +643,7 @@ impl HttpTransport {
         flight.result()?;
         let current = store.credentials();
         self.guard_store_credentials(store, &current)?;
+        original.require_same_session(&current)?;
         Ok(current)
     }
 
@@ -575,7 +651,7 @@ impl HttpTransport {
         &self,
         store: &Arc<dyn SessionStore>,
         current: &SessionCredentials,
-        failed_access: &str,
+        original: &SessionCredentials,
         confirmed_rejection: &mut bool,
     ) -> Result<String, ClientError> {
         let mut rejected = current.clone();
@@ -585,8 +661,9 @@ impl HttpTransport {
         let outcome = store.refresh(&mut |latest| {
             let result = (|| {
                 self.guard_store_credentials(store, &latest)?;
+                original.require_same_session(&latest)?;
                 rejected = latest.clone();
-                if latest.access_token != failed_access {
+                if latest.access_token != original.access_token {
                     return Ok(latest);
                 }
                 let fingerprint = Sha256::digest(latest.refresh_token.as_bytes()).into();
@@ -604,10 +681,17 @@ impl HttpTransport {
                     None,
                     Some(&mut refresh_rejected),
                 )?;
-                read_credentials(value).map_err(|mut error| {
-                    error.status = Some(status);
-                    error
-                })
+                read_credentials(&value, "invalid refresh response")
+                    .and_then(|credentials| {
+                        original
+                            .require_same_session(&credentials)
+                            .map_err(|_| ClientError::local("invalid refresh response".into()))?;
+                        Ok(credentials)
+                    })
+                    .map_err(|mut error| {
+                        error.status = Some(status);
+                        error
+                    })
             })();
             if let Err(error) = &result {
                 callback_error = Some(error.clone());
@@ -617,6 +701,7 @@ impl HttpTransport {
         match outcome {
             Ok(refreshed) => {
                 self.guard_store_credentials(store, &refreshed)?;
+                original.require_same_session(&refreshed)?;
                 if let Some(fingerprint) = attempted_token {
                     blocked_refresh_tokens()
                         .lock()
@@ -799,7 +884,9 @@ impl HttpTransport {
                 "session store is bound to a different origin".into(),
             ));
         }
-        if !valid_token(&credentials.access_token) || !valid_token(&credentials.refresh_token) {
+        if !credentials.is_empty()
+            && (!valid_token(&credentials.access_token) || !valid_token(&credentials.refresh_token))
+        {
             return Err(ClientError::local("invalid session credential".into()));
         }
         Ok(())
@@ -982,9 +1069,12 @@ fn validate_origin(origin: &str) -> Result<String, ClientError> {
     Ok(format!("{}://{}", scheme, authority))
 }
 
-fn read_credentials(value: Value) -> Result<SessionCredentials, ClientError> {
-    let credentials: SessionCredentials = serde_json::from_value(value)
-        .map_err(|_| ClientError::local("invalid refresh response".into()))?;
+fn read_credentials(
+    value: &Value,
+    invalid_message: &str,
+) -> Result<SessionCredentials, ClientError> {
+    let credentials = SessionCredentials::deserialize(value)
+        .map_err(|_| ClientError::local(invalid_message.into()))?;
     if !valid_token(&credentials.access_token)
         || !valid_token(&credentials.refresh_token)
         || credentials.expires_at.is_empty()
@@ -992,7 +1082,7 @@ fn read_credentials(value: Value) -> Result<SessionCredentials, ClientError> {
         || credentials.user_id.is_empty()
         || credentials.session_id.is_empty()
     {
-        return Err(ClientError::local("invalid refresh response".into()));
+        return Err(ClientError::local(invalid_message.into()));
     }
     Ok(credentials)
 }

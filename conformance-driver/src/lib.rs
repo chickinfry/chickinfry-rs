@@ -22,12 +22,15 @@ use session::{Credentials, Store};
 #[cfg(feature = "sdk")]
 use chickinfry_client_auth as auth_sdk;
 #[cfg(feature = "sdk")]
+use chickinfry_client_empty_session as empty_session_sdk;
+#[cfg(feature = "sdk")]
 use chickinfry_client_plain as plain_sdk;
 
 #[derive(Clone, Copy)]
 enum Fixture {
     Plain,
     Auth,
+    EmptySession,
 }
 
 impl Fixture {
@@ -35,6 +38,7 @@ impl Fixture {
         match protocol::string(args, "fixture")? {
             "plain" => Ok(Self::Plain),
             "auth" => Ok(Self::Auth),
+            "emptySession" => Ok(Self::EmptySession),
             _ => Err(Error::driver("invalid_args")),
         }
     }
@@ -44,6 +48,7 @@ impl Fixture {
 enum Bridge {
     Plain(plain_sdk::Client),
     Auth(auth_sdk::Client),
+    EmptySession(empty_session_sdk::Client),
 }
 
 struct Handle {
@@ -63,6 +68,9 @@ impl Handle {
             sdk: match fixture {
                 Fixture::Plain => Bridge::Plain(plain_sdk::create_client(transport.clone())),
                 Fixture::Auth => Bridge::Auth(auth_sdk::create_client(transport.clone())),
+                Fixture::EmptySession => {
+                    Bridge::EmptySession(empty_session_sdk::create_client(transport.clone()))
+                }
             },
             fixture,
             transport,
@@ -374,9 +382,12 @@ impl<W: Write + Send + 'static> State<W> {
         let fields: &[&str] = match (handle.fixture, operation) {
             (_, "probe.echo") => &["wire_value"],
             (_, "probe.identify") => &["id"],
-            (_, "probe.list") | (Fixture::Auth, "auth.session" | "auth.logout") => &[],
+            (_, "probe.list")
+            | (Fixture::Auth, "auth.session" | "auth.logout")
+            | (Fixture::EmptySession, "auth.logout") => &[],
             (Fixture::Auth, "auth.refresh") => &["refresh_token"],
-            (Fixture::Auth, "auth.signin" | "auth.signup") => &["email", "password"],
+            (Fixture::Auth, "auth.signin" | "auth.signup")
+            | (Fixture::EmptySession, "auth.signin") => &["email", "password"],
             _ => return Err(Error::driver("unimplemented")),
         };
         let mut input = request
@@ -754,18 +765,36 @@ fn typed_call(
                 }
             };
         }
+        macro_rules! tokens {
+            ($output:expr) => {{
+                let output = $output?;
+                return Ok(json!({"access_token":output.access_token, "refresh_token":output.refresh_token,
+                    "expires_at":output.expires_at, "refresh_expires_at":output.refresh_expires_at,
+                    "user_id":output.user_id, "session_id":output.session_id}));
+            }};
+        }
         match &handle.sdk {
+            Bridge::EmptySession(client) => {
+                probe!(empty_session_sdk, client);
+                match operation {
+                    "auth.signin" => tokens!(client.auth.signin(
+                        &empty_session_sdk::client::AuthSigninInput {
+                            email: input["email"].as_str().expect("validated input").into(),
+                            password: input["password"].as_str().expect("validated input").into(),
+                        }
+                    )),
+                    "auth.logout" => {
+                        let output = client
+                            .auth
+                            .logout(&empty_session_sdk::client::AuthLogoutInput {})?;
+                        return Ok(json!({"status":output.status}));
+                    }
+                    _ => {}
+                }
+            }
             Bridge::Plain(client) => probe!(plain_sdk, client),
             Bridge::Auth(client) => {
                 probe!(auth_sdk, client);
-                macro_rules! tokens {
-                    ($output:expr) => {{
-                        let output = $output?;
-                        return Ok(json!({"access_token":output.access_token, "refresh_token":output.refresh_token,
-                            "expires_at":output.expires_at, "refresh_expires_at":output.refresh_expires_at,
-                            "user_id":output.user_id, "session_id":output.session_id}));
-                    }};
-                }
                 match operation {
                     "auth.refresh" => tokens!(
                         client.auth.refresh(&auth_sdk::client::AuthRefreshInput {

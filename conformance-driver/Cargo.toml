@@ -7,13 +7,14 @@ publish = false
 
 [features]
 default = ["sdk"]
-sdk = ["dep:chickinfry-client-plain", "dep:chickinfry-client-auth"]
+sdk = ["dep:chickinfry-client-plain", "dep:chickinfry-client-auth", "dep:chickinfry-client-empty-session"]
 conformance = ["chickinfry/conformance"]
 
 [dependencies]
 chickinfry = { path = "..", default-features = false }
 chickinfry-client-plain = { version = "=0.1.0", optional = true }
 chickinfry-client-auth = { version = "=0.1.0", optional = true }
+chickinfry-client-empty-session = { version = "=0.1.0", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

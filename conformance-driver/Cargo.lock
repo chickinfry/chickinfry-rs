@@ -92,6 +92,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "chickinfry-client-empty-session"
+version = "0.1.0"
+dependencies = [
+ "chickinfry",
+]
+
+[[package]]
 name = "chickinfry-client-plain"
 version = "0.1.0"
 dependencies = [
@@ -104,6 +111,7 @@ version = "0.1.0"
 dependencies = [
  "chickinfry",
  "chickinfry-client-auth",
+ "chickinfry-client-empty-session",
  "chickinfry-client-plain",
  "serde",
  "serde_json",
