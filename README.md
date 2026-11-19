@@ -76,8 +76,7 @@ are never copied into the device files.
 
 Generated applications must explicitly implement `Application::AUTH_ENABLED`
 from the authentication declaration in `auth.yml`. This flag is independent of
-`REQUIRES_DATABASE`, which only requires a database binding. Regenerate existing
-applications with a CLI version that emits `AUTH_ENABLED` before upgrading.
+`REQUIRES_DATABASE`, which only requires a database binding.
 
 With authentication disabled, requests reach handlers without session lookup,
 `Authorization` and `Cookie` headers remain available, and undeclared `/auth.*`
@@ -85,11 +84,11 @@ operations return `404 not_found`. Identity providers and authentication hooks
 require an authentication declaration; otherwise serving fails with
 `declare auth in auth.yml`.
 
-With authentication enabled, the runtime resolves sessions and handles built-in
-authentication operations. It removes `Authorization` and `Cookie` headers
-before building the customer context and request view. The `auth.session`
-response includes `expires_at` in RFC 3339 UTC format, bounded by both the stored
-refresh expiry and the current session policy.
+With authentication enabled, the request host handles built-in authentication
+operations and supplies the verified session for each application request.
+Protected handlers receive a session. Public handlers receive an optional
+session. The session contains its ID and the user's ID and email. Application
+handlers do not receive the original authentication headers.
 
 ## License
 

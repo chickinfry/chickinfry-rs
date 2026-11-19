@@ -3,7 +3,7 @@
 //! opaque bearer tokens, typed error envelopes, and no retry on business
 //! failures.
 
-use crate::database::DatabasePort;
+use crate::database::{DatabasePort, TransactionPort};
 pub use crate::error_details::FieldError;
 use crate::error_details::{valid_error_code, valid_fields, valid_message};
 use crate::wasm_bindgen;
@@ -231,16 +231,15 @@ impl RequestView {
     }
 }
 
-/// One authenticated application session, resolved from the private bearer
-/// token through the authentication core.
+/// One application session verified by the request host.
 #[derive(Clone)]
 pub struct Session {
     pub id: String,
     pub user: SessionUser,
-    pub expires_at: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionUser {
     pub id: String,
     pub email: String,
@@ -399,6 +398,7 @@ pub fn write_output<T: serde::Serialize>(output: T) -> Result<serde_json::Value,
 #[derive(serde::Deserialize)]
 struct RequestMetadata {
     config: Option<crate::RuntimeConfig>,
+    database: Option<bool>,
     id: Option<u64>,
     method: String,
     path: String,
@@ -406,6 +406,37 @@ struct RequestMetadata {
     query: String,
     #[serde(default)]
     headers: Vec<(String, String)>,
+    auth: Option<HostAuthentication>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostAuthentication {
+    version: u32,
+    #[serde(deserialize_with = "serde::Deserialize::deserialize")]
+    session: Option<HostSession>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostSession {
+    id: String,
+    user: SessionUser,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthHookFrame {
+    version: u32,
+    hook: AuthHook,
+    user: crate::auth::AuthUser,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum AuthHook {
+    UserCreating,
+    UserCreated,
 }
 
 struct ResponseEnvelope {
@@ -535,6 +566,46 @@ fn validate_application<A: Application>(application: &A) -> Result<(), &'static 
     Ok(())
 }
 
+/// Dispatches a callback from the trusted host entry using its current lease.
+#[doc(hidden)]
+pub async fn serve_auth_hook<A: Application>(
+    application: &A,
+    metadata: &[u8],
+    rid: u64,
+    lease: Option<u64>,
+) -> Result<(), OperationError> {
+    use crate::auth::UserCreationHooks;
+
+    if !A::AUTH_ENABLED || rid == 0 || metadata.len() > REQUEST_BODY_LIMIT {
+        return Err(OperationError::internal());
+    }
+    let frame: AuthHookFrame =
+        serde_json::from_slice(metadata).map_err(|_| OperationError::internal())?;
+    let user = &frame.user;
+    if frame.version != 1
+        || user.id.is_empty()
+        || user.email.is_empty()
+        || user.created_at.is_empty()
+    {
+        return Err(OperationError::internal());
+    }
+    let hooks = application.auth_hooks();
+    crate::logging::scope(rid, async {
+        match (frame.hook, lease) {
+            (AuthHook::UserCreating, Some(lease)) if lease != 0 => hooks
+                .creating(TransactionPort::borrowed(rid, lease), user)
+                .await
+                .map_err(|_| OperationError::from_code("user_creation_failed", 500)),
+            (AuthHook::UserCreated, None) => hooks
+                .committed(user)
+                .await
+                .map_err(|_| OperationError::from_code("user_created_effect_failed", 500)),
+            _ => Err(OperationError::internal()),
+        }
+    })
+    .await
+}
+
 /// Serves one request frame. The engine glue supplies the request metadata and
 /// body separately and consumes the response envelope.
 pub async fn serve<A: Application>(
@@ -629,13 +700,7 @@ async fn serve_request<A: Application>(
         Some(operation) if !operation.is_empty() => operation.to_string(),
         _ => return Ok(error_envelope(404, "not_found")),
     };
-    let builtin = A::AUTH_ENABLED
-        && (matches!(
-            operation.as_str(),
-            "auth.refresh" | "auth.session" | "auth.logout" | "auth.identity"
-        ) || A::EMAIL_PASSWORD_ENABLED
-            && matches!(operation.as_str(), "auth.signup" | "auth.signin"));
-    if !builtin && !application.accepts(&operation) {
+    if operation.starts_with("auth.") || !application.accepts(&operation) {
         return Ok(error_envelope(404, "not_found"));
     }
     let content_type = parsed
@@ -646,7 +711,10 @@ async fn serve_request<A: Application>(
     if content_type.as_deref() != Some("application/json") {
         return Ok(error_envelope(415, "unsupported_media_type"));
     }
-    if A::REQUIRES_DATABASE && config.database_url.is_none() {
+    let has_database = parsed
+        .database
+        .unwrap_or_else(|| config.database_url.is_some());
+    if A::REQUIRES_DATABASE && !has_database {
         return Ok(error_envelope(503, "service_unavailable"));
     }
     let input = match serde_json::from_slice::<json::Input>(&body) {
@@ -672,77 +740,32 @@ async fn serve_request<A: Application>(
             _ => unreachable!(),
         }
     }
-    let authorization = parsed
-        .headers
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case("authorization"));
-    let bearer = || -> Result<&str, OperationError> {
-        let value = authorization
-            .map(|(_, value)| value.as_str())
-            .ok_or_else(OperationError::invalid_token)?;
-        let (scheme, token) = value
-            .split_once(' ')
-            .ok_or_else(OperationError::invalid_token)?;
-        if !scheme.eq_ignore_ascii_case("bearer")
-            || token.len() != 43
-            || !token
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    let session = match (A::AUTH_ENABLED, parsed.auth) {
+        (false, None)
+        | (
+            true,
+            Some(HostAuthentication {
+                version: 1,
+                session: None,
+            }),
+        ) => None,
+        (
+            true,
+            Some(HostAuthentication {
+                version: 1,
+                session: Some(session),
+            }),
+        ) if !session.id.is_empty()
+            && !session.user.id.is_empty()
+            && !session.user.email.is_empty() =>
         {
-            return Err(OperationError::invalid_token());
+            Some(Session {
+                id: session.id,
+                user: session.user,
+            })
         }
-        Ok(token)
+        _ => return Ok(error_envelope(500, "operation_failed")),
     };
-    let text = |key: &str| {
-        input
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| OperationError::from_code("invalid_input", 400))
-    };
-    let mut session = None;
-    if A::AUTH_ENABLED {
-        let hooks = application.auth_hooks();
-        let auth = match crate::auth::Auth::new(
-            DatabasePort::new(rid),
-            application.identity_providers(),
-            &hooks,
-        )
-        .and_then(|auth| {
-            auth.with_session_policy(
-                A::SESSION_IDLE_TIMEOUT_SECONDS,
-                A::SESSION_ABSOLUTE_LIFETIME_SECONDS,
-            )
-        }) {
-            Ok(auth) => auth,
-            Err(error) => return Ok(operation_error_envelope(error, &[])),
-        };
-        if builtin {
-            let output: Result<serde_json::Value, OperationError> = async {
-                match operation.as_str() {
-                    "auth.signup" => serde_json::to_value(auth.signup(text("email")?, text("password")?).await?).map_err(|_| OperationError::internal()),
-                    "auth.signin" => serde_json::to_value(auth.signin(text("email")?, text("password")?).await?).map_err(|_| OperationError::internal()),
-                    "auth.identity" => serde_json::to_value(auth.signin_identity(text("provider")?, input.get("credential").unwrap_or(&serde_json::Value::Null)).await?).map_err(|_| OperationError::internal()),
-                    "auth.refresh" => serde_json::to_value(auth.refresh(text("refresh_token")?).await?).map_err(|_| OperationError::internal()),
-                    "auth.session" => {
-                        let session = auth.session(bearer()?).await?;
-                        Ok(serde_json::json!({"id":session.user.id,"email":session.user.email,"session_id":session.id,"expires_at":session.expires_at}))
-                    }
-                    "auth.logout" => { auth.logout(bearer()?).await?; Ok(serde_json::json!({"status":"ok"})) }
-                    _ => Err(OperationError::from_code("not_found", 404)),
-                }
-            }.await;
-            return Ok(match output {
-                Ok(body) => ResponseEnvelope { status: 200, body },
-                Err(error) => operation_error_envelope(error, &[]),
-            });
-        }
-        if authorization.is_some() {
-            match async { auth.session(bearer()?).await }.await {
-                Ok(value) => session = Some(value),
-                Err(error) => return Ok(operation_error_envelope(error, &[])),
-            }
-        }
-    }
     let mut headers = parsed.headers;
     headers.retain(|(name, _)| !is_credential_header(name, A::AUTH_ENABLED));
     let runtime = RuntimeContext {
@@ -752,7 +775,7 @@ async fn serve_request<A: Application>(
         query: parsed.query,
         headers,
         session,
-        database: config.database_url.as_ref().map(|_| DatabasePort::new(rid)),
+        database: has_database.then(|| DatabasePort::new(rid)),
         secrets: config.secrets.clone(),
         vault: Vault::from_config(config),
     };
@@ -820,8 +843,178 @@ mod tests {
                 "headers": context.headers,
                 "request_headers": context.request.headers,
                 "authenticated": context.session.is_some(),
+                "session_id": context.session.as_ref().map(|session| &session.id),
+                "user_id": context.session.as_ref().map(|session| &session.user.id),
             }))
         }
+    }
+
+    fn host_auth_request(auth: Option<Value>, credentials: bool) -> (ResponseEnvelope, usize) {
+        let mut frame = json!({
+            "id": 47,
+            "method": "POST",
+            "path": "/probe.headers",
+            "headers": [["content-type", "application/json"], ["x-request-label", "visible"]],
+        });
+        if let Some(auth) = auth {
+            frame["auth"] = auth;
+        }
+        if credentials {
+            frame["headers"].as_array_mut().unwrap().extend([
+                json!(["aUtHoRiZaTiOn", format!("Bearer {:043}", 1)]),
+                json!(["cOoKiE", "test-only=unused"]),
+                json!(["Proxy-Authorization", "test-only"]),
+            ]);
+        }
+        let calls = Rc::new(Cell::new(0));
+        let database_calls = calls.clone();
+        let config = crate::RuntimeConfig {
+            database_url: Some("configured".into()),
+            ..Default::default()
+        };
+        let result = testing::run(
+            move |_| {
+                database_calls.set(database_calls.get() + 1);
+                json!({"rows": []})
+            },
+            serve_inner(
+                &App::<true, true>,
+                serde_json::to_vec(&frame).unwrap(),
+                b"{}".to_vec(),
+                &config,
+            ),
+        )
+        .unwrap_or_else(|status| error_envelope(status, "operation_failed"));
+        (result, calls.get())
+    }
+
+    fn host_auth_session() -> Value {
+        json!({"version": 1, "session": {
+            "id": "session-id", "user": {"id": "user-id", "email": "user@example.test"},
+        }})
+    }
+
+    #[test]
+    fn host_auth_projects_session_without_native_lookup() {
+        let (response, database_calls) = host_auth_request(Some(host_auth_session()), false);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body["session_id"], "session-id");
+        assert_eq!(response.body["user_id"], "user-id");
+        assert_eq!(database_calls, 0);
+    }
+
+    #[test]
+    fn host_auth_distinguishes_anonymous_from_invalid_frames() {
+        let (response, database_calls) =
+            host_auth_request(Some(json!({"version": 1, "session": null})), false);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body["authenticated"], false);
+        assert_eq!(database_calls, 0);
+        for frame in [
+            None,
+            Some(Value::Null),
+            Some(json!({"version": 1})),
+            Some(json!({"version": 2, "session": null})),
+            Some(json!({"version": 1, "session": {"id": "incomplete"}})),
+        ] {
+            let (response, database_calls) = host_auth_request(frame, false);
+            assert_eq!(response.status, 500);
+            assert_eq!(response.body, json!({"error": "operation_failed"}));
+            assert_eq!(database_calls, 0);
+        }
+    }
+
+    #[test]
+    fn host_auth_does_not_forward_or_revalidate_credential_headers() {
+        let (response, database_calls) = host_auth_request(Some(host_auth_session()), true);
+        assert_eq!(database_calls, 0);
+        assert_eq!(response.status, 200);
+        let expected = json!([
+            ["content-type", "application/json"],
+            ["x-request-label", "visible"]
+        ]);
+        assert_eq!(response.body["headers"], expected);
+        assert_eq!(response.body["request_headers"], expected);
+    }
+
+    struct HookProbe {
+        created: Cell<usize>,
+    }
+
+    impl auth::UserCreationHooks for &HookProbe {
+        async fn creating(
+            &self,
+            port: crate::database::TransactionPort,
+            user: &auth::AuthUser,
+        ) -> Result<(), OperationError> {
+            assert_eq!(user.id, "new-user");
+            assert_eq!(user.created_at, "2026-11-20T00:00:00.000000Z");
+            port.query("domain write", &[]).await?;
+            assert!(port.commit().await.is_err());
+            port.rollback().await;
+            Err(OperationError::internal())
+        }
+
+        async fn committed(&self, _user: &auth::AuthUser) -> Result<(), OperationError> {
+            self.created.set(self.created.get() + 1);
+            Ok(())
+        }
+    }
+
+    impl Application for HookProbe {
+        type Context = Context;
+        const AUTH_ENABLED: bool = true;
+        const REQUIRES_DATABASE: bool = true;
+
+        fn accepts(&self, _: &str) -> bool {
+            false
+        }
+
+        fn auth_hooks(&self) -> impl auth::UserCreationHooks {
+            self
+        }
+
+        async fn invoke(&self, _: &Context, _: &str, _: Value) -> Result<Value, DispatchError> {
+            panic!("hook reached business dispatch")
+        }
+    }
+
+    #[test]
+    fn host_auth_creation_hook_only_queries_the_borrowed_lease() {
+        let probe = HookProbe {
+            created: Cell::new(0),
+        };
+        let mut frame = json!({"version": 1, "hook": "userCreating", "user": {
+            "id": "new-user", "email": "user@example.test", "createdAt": "2026-11-20T00:00:00.000000Z"
+        }});
+        let frame_bytes = serde_json::to_vec(&frame).unwrap();
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let host_calls = calls.clone();
+        let result = testing::run(
+            move |call| {
+                host_calls.borrow_mut().push(call);
+                json!({"rows": []})
+            },
+            serve_auth_hook(&probe, &frame_bytes, 47, Some(9)),
+        );
+        assert!(
+            matches!(result, Err(error) if error.code == "user_creation_failed" && error.status == 500)
+        );
+        assert_eq!(
+            *calls.borrow(),
+            vec![json!({"op":"exec", "rid":47, "lease":9, "sql":"domain write", "params":[]})]
+        );
+        assert_eq!(probe.created.get(), 0);
+
+        frame["hook"] = json!("userCreated");
+        let frame_bytes = serde_json::to_vec(&frame).unwrap();
+        let no_db = |_| panic!("unexpected database call in post-commit hook");
+        let wrong = testing::run(no_db, serve_auth_hook(&probe, &frame_bytes, 47, Some(9)));
+        assert!(matches!(wrong, Err(error) if error.code == "operation_failed"));
+        assert_eq!(probe.created.get(), 0);
+        let result = testing::run(no_db, serve_auth_hook(&probe, &frame_bytes, 47, None));
+        assert!(result.is_ok());
+        assert_eq!(probe.created.get(), 1);
     }
 
     struct InputApp<const AUTH: bool>(Cell<usize>);
@@ -1134,23 +1327,11 @@ mod tests {
     }
 
     #[test]
-    fn builtin_auth_rejects_invalid_input_before_authentication() {
+    fn host_auth_builtin_operations_do_not_dispatch_in_rust() {
         let application = InputApp::<true>(Cell::new(0));
-        let response = input_request(&application, "auth.signup", nested_input(65, "null", false));
-        assert_eq!(response.status, 400);
-        assert_eq!(response.body, json!({"error": "invalid_input"}));
-        assert_eq!(application.0.get(), 0);
-        let response = input_request(
-            &application,
-            "auth.signup",
-            r#"{"email":"first@example.test","email":"second@example.test","password":"unused"}"#,
-        );
-        assert_eq!(response.status, 400);
-        assert_eq!(response.body, json!({"error": "invalid_input"}));
-        assert_eq!(application.0.get(), 0);
-        let response = input_request(&application, "auth.signup", "{");
-        assert_eq!(response.status, 400);
-        assert_eq!(response.body, json!({"error": "invalid_json"}));
+        let response = input_request(&application, "auth.signup", "{}");
+        assert_eq!(response.status, 404);
+        assert_eq!(response.body, json!({"error": "not_found"}));
         assert_eq!(application.0.get(), 0);
     }
 
@@ -1307,59 +1488,25 @@ mod tests {
     }
 
     #[test]
-    fn auth_enabled_resolves_session_and_removes_credentials() {
-        let response = request(
-            App::<true, true>,
-            "probe.headers",
-            true,
-            session_script(60_000, false),
-        );
-        assert_eq!(response.status, 200);
-        assert_eq!(response.body["authenticated"], true);
-        for key in ["headers", "request_headers"] {
-            let headers = response.body[key].as_array().unwrap();
-            for name in ["authorization", "cookie", "proxy-authorization"] {
-                assert_eq!(
-                    headers
-                        .iter()
-                        .filter(|header| header[0].as_str().unwrap().eq_ignore_ascii_case(name))
-                        .count(),
-                    0,
-                    "credential header reached customer code"
-                );
-            }
-            assert!(headers.iter().any(|header| header[0] == "X-Request-Label"));
-        }
-        let rejected = request(
-            App::<true, true>,
-            "probe.headers",
-            true,
-            vec![("query", json!({"rows": []}))],
-        );
-        assert_eq!(rejected.status, 401);
-        assert_eq!(rejected.body["error"], "invalid_token");
-    }
-
-    #[test]
-    fn auth_session_reports_earlier_stored_or_current_policy_expiry() {
+    fn native_session_reports_earlier_stored_or_current_policy_expiry() {
+        let hooks = auth::NoHooks;
+        let native = auth::Auth::new(DatabasePort::new(47), &[], &hooks)
+            .and_then(|auth| auth.with_session_policy(3_600, 0))
+            .unwrap_or_else(|_| panic!("native auth fixture failed"));
         for legacy in [false, true] {
             for (stored_delta, expected_delta) in [(60_000, 60_000), (86_400_000, 3_000_000)] {
-                let response = request(
-                    App::<true, true>,
-                    "auth.session",
-                    true,
-                    session_script(stored_delta, legacy),
+                let mut script = VecDeque::from(session_script(stored_delta, legacy));
+                let session = testing::run(
+                    move |request| {
+                        let (op, reply) = script.pop_front().expect("unexpected auth call");
+                        assert_eq!(request["op"], op);
+                        reply
+                    },
+                    native.session(&format!("{:043}", 1)),
                 );
-                assert_eq!(response.status, 200);
-                assert_eq!(response.body["expires_at"], timestamp(expected_delta));
-                let keys: Vec<_> = response
-                    .body
-                    .as_object()
-                    .unwrap()
-                    .keys()
-                    .map(String::as_str)
-                    .collect();
-                assert_eq!(keys, ["email", "expires_at", "id", "session_id"]);
+                assert!(
+                    matches!(session, Ok(session) if session.expires_at == timestamp(expected_delta))
+                );
             }
         }
     }

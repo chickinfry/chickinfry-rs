@@ -1,7 +1,7 @@
 use crate::database::{DatabasePort, TransactionPort};
 use crate::orm::{Direction, Filter, FindMany, Order};
 use crate::private_auth::*;
-use crate::server::{OperationError, Session, SessionUser};
+use crate::server::{OperationError, SessionUser};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, SecondsFormat, Utc};
 use scrypt::{Params, scrypt};
@@ -13,11 +13,20 @@ use subtle::ConstantTimeEq;
 // Legacy refresh families become cleanup candidates once their fixed storage lifetime has passed, regardless of the session expiry value.
 const LEGACY_REFRESH_LIFETIME_MILLIS: i64 = 604_800_000;
 
-#[derive(Clone)]
+#[derive(Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AuthUser {
     pub id: String,
     pub email: String,
     pub created_at: String,
+}
+
+/// Session returned by the native authentication core.
+#[derive(Clone)]
+pub struct Session {
+    pub id: String,
+    pub user: SessionUser,
+    pub expires_at: String,
 }
 
 #[derive(serde::Serialize)]
@@ -104,6 +113,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn with_session_policy(
         mut self,
         idle_seconds: u64,

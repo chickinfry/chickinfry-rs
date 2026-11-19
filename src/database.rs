@@ -33,12 +33,13 @@ impl DatabasePort {
     }
 }
 
-/// Transaction-bound port over one leased connection. The port is consumed by
-/// commit or rollback, so a completed transaction cannot run further work.
+/// Transaction-bound port over one leased connection. The host rejects use
+/// after the owner's transaction or the borrow has ended.
 #[derive(Clone, Copy)]
 pub struct TransactionPort {
     pub(crate) rid: u64,
     pub(crate) lease: u64,
+    owned: bool,
 }
 
 impl TransactionPort {
@@ -50,8 +51,17 @@ impl TransactionPort {
             (None, Some(lease)) => Ok(Self {
                 rid: port.rid,
                 lease,
+                owned: true,
             }),
             _ => Err(OperationError::internal()),
+        }
+    }
+
+    pub(crate) fn borrowed(rid: u64, lease: u64) -> Self {
+        Self {
+            rid,
+            lease,
+            owned: false,
         }
     }
 
@@ -72,6 +82,9 @@ impl TransactionPort {
     /// Commits the transaction. An uncertain commit outcome surfaces as a
     /// generic failure; callers must never retry the transaction automatically.
     pub async fn commit(self) -> Result<(), OperationError> {
+        if !self.owned {
+            return Err(OperationError::internal());
+        }
         let response = host::call(HostRequest::finish(self.rid, "commit", self.lease))
             .await
             .map_err(|_| OperationError::internal())?;
@@ -83,6 +96,8 @@ impl TransactionPort {
 
     /// Rolls back quietly; a broken connection already aborted the work.
     pub async fn rollback(self) {
-        let _ = host::call(HostRequest::finish(self.rid, "rollback", self.lease)).await;
+        if self.owned {
+            let _ = host::call(HostRequest::finish(self.rid, "rollback", self.lease)).await;
+        }
     }
 }
