@@ -8,6 +8,9 @@
 #[path = "../src/client.rs"]
 mod client;
 
+#[path = "../src/error_details.rs"]
+mod error_details;
+
 mod common;
 #[path = "common/error.rs"]
 mod error;
@@ -263,6 +266,45 @@ fn roundtrip_rejects_redirects_and_preserves_error_codes() {
         );
         assert!(error.operation_error.is_none());
         assert!(error.outcome_unknown);
+    }
+}
+
+#[test]
+fn operation_errors_preserve_only_valid_response_details() {
+    let replies = [
+        response(
+            "HTTP/1.1 422 Unprocessable Entity",
+            r#"{"error":"invalid_input","message":"","fields":[{"path":"items[4294967295].quantity","code":"required"}]}"#,
+        ),
+        response(
+            "HTTP/1.1 422 Unprocessable Entity",
+            r#"{"error":"invalid_input","message":"bad\nmessage","fields":[{"path":"quantity","code":"required"}]}"#,
+        ),
+        response(
+            "HTTP/1.1 422 Unprocessable Entity",
+            r#"{"error":"invalid_input","message":"safe","fields":[{"path":"quantity","code":"required"},{"path":"items[4294967296].quantity","code":"required"}]}"#,
+        ),
+        response(
+            "HTTP/1.1 409 Conflict",
+            r#"{"error":"conflict","message":null,"fields":[{"path":"quantity","code":"required"}]}"#,
+        ),
+    ];
+    let (origin, _receiver) = serve(&replies);
+    let client = HttpTransport::new(&origin, None).expect("valid origin");
+    for (message, paths) in [
+        (Some(""), &["items[4294967295].quantity"][..]),
+        (None, &["quantity"][..]),
+        (Some("safe"), &[][..]),
+        (None, &[][..]),
+    ] {
+        let error = operation_error(client.invoke("probe.echo", &json!({})).unwrap_err());
+        assert_eq!(error.response_message.as_deref(), message);
+        let actual: Vec<_> = error
+            .fields
+            .iter()
+            .map(|field| field.path.as_str())
+            .collect();
+        assert_eq!(actual, paths);
     }
 }
 

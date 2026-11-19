@@ -37,6 +37,8 @@ pub enum Persist {
     Dir(PathBuf),
 }
 
+pub use crate::error_details::FieldError;
+use crate::error_details::{valid_error_code, valid_fields, valid_message};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -56,6 +58,8 @@ pub mod conformance;
 pub struct OperationError {
     pub code: String,
     pub status: u16,
+    pub response_message: Option<String>,
+    pub fields: Vec<FieldError>,
 }
 
 impl fmt::Display for OperationError {
@@ -860,7 +864,27 @@ impl HttpTransport {
                 }
                 _ => return Err(ClientError::new("internal", Some(status), true)),
             };
-            let mut error = ClientError::remote(OperationError { code, status });
+            let response_message = value
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|message| valid_message(message))
+                .map(str::to_owned);
+            let fields = if code == "invalid_input" {
+                value
+                    .get("fields")
+                    .filter(|value| value.as_array().is_some_and(|items| items.len() <= 32))
+                    .and_then(|value| Vec::<FieldError>::deserialize(value).ok())
+                    .filter(|fields| valid_fields(fields, None))
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let mut error = ClientError::remote(OperationError {
+                code,
+                status,
+                response_message,
+                fields,
+            });
             error.outcome_unknown = operation == REFRESH_OPERATION
                 && self.session.is_some()
                 && (status == 429 || status >= 500);
@@ -1108,14 +1132,6 @@ fn valid_segment(segment: &str) -> bool {
     characters.all(|character| {
         character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
     })
-}
-
-fn valid_error_code(code: &str) -> bool {
-    !code.is_empty()
-        && code.len() <= 64
-        && code
-            .bytes()
-            .all(|byte| byte == b'_' || byte.is_ascii_lowercase())
 }
 
 #[cfg(test)]

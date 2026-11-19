@@ -23,6 +23,7 @@ pub mod auth;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod client;
 pub mod database;
+mod error_details;
 pub mod host;
 mod logging;
 pub mod orm;

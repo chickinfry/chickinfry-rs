@@ -8,6 +8,9 @@
 #[path = "../src/client.rs"]
 mod client;
 
+#[path = "../src/error_details.rs"]
+mod error_details;
+
 mod common;
 #[path = "common/error.rs"]
 mod error;
@@ -757,6 +760,8 @@ fn unknown_refresh_blocks_later_calls_on_the_same_store() {
                 operation_error: Some(client::OperationError {
                     code: "invalid_token".into(),
                     status: 401,
+                    response_message: None,
+                    fields: Vec::new(),
                 }),
                 ..ClientError::new("unauthenticated", None, false)
             }),

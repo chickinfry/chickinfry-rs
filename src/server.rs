@@ -4,6 +4,8 @@
 //! failures.
 
 use crate::database::DatabasePort;
+pub use crate::error_details::FieldError;
+use crate::error_details::{valid_error_code, valid_fields, valid_message};
 use crate::wasm_bindgen;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -25,31 +27,8 @@ pub struct RuntimeContext {
     pub headers: Vec<(String, String)>,
     pub session: Option<Session>,
     pub database: Option<DatabasePort>,
-    secrets: Secrets,
+    secrets: std::collections::BTreeMap<String, String>,
     vault: Vault,
-}
-
-/// Project secrets resolved from the private binding frame. Missing values
-/// surface at access time with the shared service_unavailable status.
-#[derive(Clone)]
-pub struct Secrets {
-    values: std::collections::BTreeMap<String, String>,
-}
-
-impl Secrets {
-    pub fn from_config() -> Secrets {
-        Secrets {
-            values: crate::config().secrets.clone(),
-        }
-    }
-
-    pub fn get(&self, name: &str) -> Result<String, OperationError> {
-        self.values
-            .get(name)
-            .filter(|value| !value.is_empty())
-            .cloned()
-            .ok_or_else(|| OperationError::new("service_unavailable", 503))
-    }
 }
 
 /// One declared logical storage, routed per request through the shared host
@@ -109,7 +88,7 @@ impl Storage {
 
 fn storage_error(code: &str) -> OperationError {
     if code == "service_unavailable" {
-        OperationError::new("service_unavailable", 503)
+        OperationError::from_code("service_unavailable", 503)
     } else {
         OperationError::internal()
     }
@@ -169,7 +148,7 @@ impl Vault {
     }
 
     fn resolve(&self) -> Result<std::collections::BTreeMap<String, String>, OperationError> {
-        let unavailable = || OperationError::new("service_unavailable", 503);
+        let unavailable = || OperationError::from_code("service_unavailable", 503);
         let raw = self.raw.as_deref().filter(|value| !value.is_empty());
         if self.scope.is_empty() || self.project.is_empty() {
             return Err(unavailable());
@@ -199,8 +178,13 @@ impl Vault {
 }
 
 impl RuntimeContext {
-    pub fn secrets(&self) -> Secrets {
-        self.secrets.clone()
+    #[doc(hidden)]
+    pub fn secret(&self, name: &str) -> Result<String, OperationError> {
+        self.secrets
+            .get(name)
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .ok_or_else(|| OperationError::from_code("service_unavailable", 503))
     }
 
     pub fn vault(&self) -> Vault {
@@ -267,41 +251,47 @@ pub struct SessionUser {
 pub struct OperationError {
     pub code: String,
     pub status: u16,
+    pub message: Option<String>,
+    pub fields: Vec<FieldError>,
     database_code: Option<String>,
 }
 
 impl OperationError {
-    pub fn new(code: &str, status: u16) -> OperationError {
-        let allowed = !code.is_empty()
-            && code.len() <= 64
-            && code
-                .chars()
-                .all(|character| character.is_ascii_lowercase() || character == '_');
-        if !allowed {
+    /// Creates an operation error with explicitly public response details.
+    pub fn new(code: &str, status: u16, message: Option<&str>, fields: Vec<FieldError>) -> Self {
+        if !valid_error_code(code) || !(400..=599).contains(&status) {
             return Self::internal();
         }
-        OperationError {
+        Self {
             code: code.to_string(),
             status,
+            message: message.map(str::to_owned),
+            fields,
             database_code: None,
         }
+    }
+
+    pub(crate) fn from_code(code: &str, status: u16) -> Self {
+        Self::new(code, status, None, Vec::new())
     }
 
     /// Generic internal failure. Internal details never reach the wire.
-    pub fn internal() -> OperationError {
-        OperationError {
+    pub fn internal() -> Self {
+        Self {
             code: "operation_failed".to_string(),
             status: 500,
+            message: None,
+            fields: Vec::new(),
             database_code: None,
         }
     }
 
-    pub fn unauthenticated() -> OperationError {
-        Self::new("unauthenticated", 401)
+    pub fn unauthenticated() -> Self {
+        Self::from_code("unauthenticated", 401)
     }
 
-    pub fn invalid_token() -> OperationError {
-        Self::new("invalid_token", 401)
+    pub fn invalid_token() -> Self {
+        Self::from_code("invalid_token", 401)
     }
 
     pub(crate) fn database(code: String) -> Self {
@@ -360,6 +350,10 @@ pub trait Application {
     type Context: ProjectContext;
     /// Whether the declared operations include this operation identifier.
     fn accepts(&self, operation: &str) -> bool;
+    #[doc(hidden)]
+    fn input_fields(&self, _operation: &str) -> &'static [&'static str] {
+        &[]
+    }
     /// Whether the project declares a database profile.
     const REQUIRES_DATABASE: bool;
     /// Whether the project declares platform authentication in auth.yml.
@@ -420,26 +414,82 @@ struct ResponseEnvelope {
 }
 
 fn error_envelope(status: u16, code: &str) -> ResponseEnvelope {
-    let valid = (400..=599).contains(&status)
-        && !code.is_empty()
-        && code.len() <= 64
-        && code
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte == b'_');
-    let (status, code) = if valid {
-        (status, code)
-    } else {
-        (500, "operation_failed")
-    };
+    operation_error_envelope(OperationError::from_code(code, status), &[])
+}
+
+fn operation_error_envelope(error: OperationError, declared: &[&str]) -> ResponseEnvelope {
+    if !(400..=599).contains(&error.status) || !valid_error_code(&error.code) {
+        return ResponseEnvelope {
+            status: 500,
+            body: serde_json::json!({"error": "operation_failed"}),
+        };
+    }
+    let mut body = serde_json::json!({ "error": error.code });
+    if let Some(message) = error.message.filter(|message| valid_message(message)) {
+        body["message"] = serde_json::Value::String(message);
+    }
+    if error.code == "invalid_input"
+        && !error.fields.is_empty()
+        && valid_fields(&error.fields, Some(declared))
+    {
+        body["fields"] = serde_json::json!(error.fields);
+    }
     ResponseEnvelope {
-        status,
-        body: serde_json::json!({ "error": code }),
+        status: error.status,
+        body,
     }
 }
 
 #[cfg(test)]
 mod public_error_tests {
     use super::*;
+
+    #[test]
+    fn operation_errors_validate_optional_details_at_the_wire_boundary() {
+        let field = |path: &str| FieldError {
+            path: path.into(),
+            code: "too_large".into(),
+        };
+        let error = OperationError::new("invalid_input", 422, Some(""), vec![field("quantity")]);
+        let response = operation_error_envelope(error, &["quantity"]);
+        assert_eq!(response.status, 422);
+        assert_eq!(
+            response.body,
+            serde_json::json!({
+                "error": "invalid_input",
+                "message": "",
+                "fields": [{"path": "quantity", "code": "too_large"}]
+            })
+        );
+
+        let error = OperationError::new(
+            "invalid_input",
+            422,
+            Some("safe"),
+            vec![field("quantity"), field("undeclared")],
+        );
+        assert_eq!(
+            operation_error_envelope(error, &["quantity"]).body,
+            serde_json::json!({"error": "invalid_input", "message": "safe"})
+        );
+
+        let mut error =
+            OperationError::new("invalid_input", 422, Some("safe"), vec![field("quantity")]);
+        error.message = Some("bad\nmessage".into());
+        assert_eq!(
+            operation_error_envelope(error.clone(), &["quantity"]).body,
+            serde_json::json!({"error": "invalid_input", "fields": [{"path": "quantity", "code": "too_large"}]})
+        );
+
+        error.status = 200;
+        error.message = Some("do not reflect".into());
+        let response = operation_error_envelope(error, &["quantity"]);
+        assert_eq!(response.status, 500);
+        assert_eq!(
+            response.body,
+            serde_json::json!({"error": "operation_failed"})
+        );
+    }
 
     #[test]
     fn error_output_validates_mutable_public_members() {
@@ -647,7 +697,7 @@ async fn serve_request<A: Application>(
         input
             .get(key)
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| OperationError::new("invalid_input", 400))
+            .ok_or_else(|| OperationError::from_code("invalid_input", 400))
     };
     let mut session = None;
     if A::AUTH_ENABLED {
@@ -664,7 +714,7 @@ async fn serve_request<A: Application>(
             )
         }) {
             Ok(auth) => auth,
-            Err(error) => return Ok(error_envelope(error.status, &error.code)),
+            Err(error) => return Ok(operation_error_envelope(error, &[])),
         };
         if builtin {
             let output: Result<serde_json::Value, OperationError> = async {
@@ -678,18 +728,18 @@ async fn serve_request<A: Application>(
                         Ok(serde_json::json!({"id":session.user.id,"email":session.user.email,"session_id":session.id,"expires_at":session.expires_at}))
                     }
                     "auth.logout" => { auth.logout(bearer()?).await?; Ok(serde_json::json!({"status":"ok"})) }
-                    _ => Err(OperationError::new("not_found", 404)),
+                    _ => Err(OperationError::from_code("not_found", 404)),
                 }
             }.await;
             return Ok(match output {
                 Ok(body) => ResponseEnvelope { status: 200, body },
-                Err(error) => error_envelope(error.status, &error.code),
+                Err(error) => operation_error_envelope(error, &[]),
             });
         }
         if authorization.is_some() {
             match async { auth.session(bearer()?).await }.await {
                 Ok(value) => session = Some(value),
-                Err(error) => return Ok(error_envelope(error.status, &error.code)),
+                Err(error) => return Ok(operation_error_envelope(error, &[])),
             }
         }
     }
@@ -703,9 +753,7 @@ async fn serve_request<A: Application>(
         headers,
         session,
         database: config.database_url.as_ref().map(|_| DatabasePort::new(rid)),
-        secrets: Secrets {
-            values: config.secrets.clone(),
-        },
+        secrets: config.secrets.clone(),
         vault: Vault::from_config(config),
     };
     let context = A::Context::build(&runtime);
@@ -715,7 +763,10 @@ async fn serve_request<A: Application>(
             body: output,
         }),
         Err(DispatchError::InvalidInput(_)) => Ok(error_envelope(400, "invalid_input")),
-        Err(DispatchError::Operation(error)) => Ok(error_envelope(error.status, &error.code)),
+        Err(DispatchError::Operation(error)) => Ok(operation_error_envelope(
+            error,
+            application.input_fields(&operation),
+        )),
         Err(DispatchError::Internal) => Ok(error_envelope(500, "operation_failed")),
     }
 }
@@ -1386,15 +1437,25 @@ mod tests {
 
     #[test]
     fn empty_declared_secret_is_unavailable() {
-        let secrets = Secrets {
-            values: [("TOKEN".into(), String::new())].into(),
+        let runtime = RuntimeContext {
+            rid: 1,
+            method: String::new(),
+            path: String::new(),
+            query: String::new(),
+            headers: Vec::new(),
+            session: None,
+            database: None,
+            secrets: [("TOKEN".into(), String::new())].into(),
+            vault: Vault::from_config(&crate::RuntimeConfig::default()),
         };
-        match secrets.get("TOKEN") {
-            Err(error) => {
-                assert_eq!(error.code, "service_unavailable");
-                assert_eq!(error.status, 503);
+        for name in ["TOKEN", "MISSING"] {
+            match runtime.secret(name) {
+                Err(error) => {
+                    assert_eq!(error.code, "service_unavailable");
+                    assert_eq!(error.status, 503);
+                }
+                Ok(_) => panic!("missing or empty secret was accepted"),
             }
-            Ok(_) => panic!("empty secret was accepted"),
         }
     }
 

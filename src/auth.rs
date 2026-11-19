@@ -93,7 +93,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                 })
                 || !ids.insert(id)
             {
-                return Err(OperationError::new("invalid_input", 400));
+                return Err(OperationError::from_code("invalid_input", 400));
             }
         }
         Ok(Self {
@@ -137,13 +137,13 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                 self.hooks
                     .creating(tx.port(), &public)
                     .await
-                    .map_err(|_| OperationError::new("user_creation_failed", 500))?;
+                    .map_err(|_| OperationError::from_code("user_creation_failed", 500))?;
                 Ok((self.issue(tx, &user).await?, public))
             })
             .await;
         let (tokens, user) = result.map_err(|error| {
             if error.unique_violation() {
-                OperationError::new("account_exists", 409)
+                OperationError::from_code("account_exists", 409)
             } else {
                 error
             }
@@ -174,7 +174,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
         let user = users
             .first()
             .filter(|user| matched && user.disabled_at.is_none())
-            .ok_or_else(|| OperationError::new("invalid_credentials", 401))?;
+            .ok_or_else(|| OperationError::from_code("invalid_credentials", 401))?;
         let tokens = self
             .db
             .transaction(async |tx| self.issue(tx, user).await)
@@ -192,16 +192,16 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
             .providers
             .iter()
             .find(|provider| provider.id() == provider_id)
-            .ok_or_else(|| OperationError::new("unsupported_identity_provider", 400))?;
+            .ok_or_else(|| OperationError::from_code("unsupported_identity_provider", 400))?;
         self.rate_limit("identity_attempt", provider_id, 100, 60_000)
             .await?;
         let identity = provider
             .verify(credential)
             .await
-            .map_err(|_| OperationError::new("invalid_credentials", 401))?;
+            .map_err(|_| OperationError::from_code("invalid_credentials", 401))?;
         let email = normalize_email(&identity.verified_email)?;
         if identity.subject.is_empty() || identity.subject.encode_utf16().count() > 2048 {
-            return Err(OperationError::new("invalid_credentials", 401));
+            return Err(OperationError::from_code("invalid_credentials", 401));
         }
         self.rate_limit(
             "identity",
@@ -225,7 +225,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                         tx.app_auth_users
                             .find_by_id(AppAuthUsersPrimaryKey { id: stored.user_id })
                             .await?
-                            .ok_or_else(|| OperationError::new("invalid_credentials", 401))?,
+                            .ok_or_else(|| OperationError::from_code("invalid_credentials", 401))?,
                         false,
                     ),
                     None => {
@@ -253,21 +253,21 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                     }
                 };
                 if user.disabled_at.is_some() {
-                    return Err(OperationError::new("invalid_credentials", 401));
+                    return Err(OperationError::from_code("invalid_credentials", 401));
                 }
                 let public = public_user(&user);
                 if created {
                     self.hooks
                         .creating(tx.port(), &public)
                         .await
-                        .map_err(|_| OperationError::new("user_creation_failed", 500))?;
+                        .map_err(|_| OperationError::from_code("user_creation_failed", 500))?;
                 }
                 Ok((self.issue(tx, &user).await?, created.then_some(public)))
             })
             .await
             .map_err(|error| {
                 if error.unique_violation() {
-                    OperationError::new("identity_conflict", 409)
+                    OperationError::from_code("identity_conflict", 409)
                 } else {
                     error
                 }
@@ -283,7 +283,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
         self.hooks
             .committed(user)
             .await
-            .map_err(|_| OperationError::new("user_created_effect_failed", 500))
+            .map_err(|_| OperationError::from_code("user_created_effect_failed", 500))
     }
 
     pub async fn session(&self, token: &str) -> Result<Session, OperationError> {
@@ -581,7 +581,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                 }))
             })
             .await?;
-        let tokens = outcome.ok_or_else(|| OperationError::new("session_revoked", 401))?;
+        let tokens = outcome.ok_or_else(|| OperationError::from_code("session_revoked", 401))?;
         self.cleanup().await;
         Ok(tokens)
     }
@@ -874,7 +874,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
             };
             let elapsed = expired(&row.expires_at)?;
             if !elapsed && row.attempt_count >= maximum {
-                return Err(OperationError::new("rate_limited", 429));
+                return Err(OperationError::from_code("rate_limited", 429));
             }
             let columns = self.db.app_auth_rate_limits.columns();
             if self
@@ -904,7 +904,7 @@ impl<'a, H: UserCreationHooks> Auth<'a, H> {
                 return Ok(());
             }
         }
-        Err(OperationError::new("rate_limited", 429))
+        Err(OperationError::from_code("rate_limited", 429))
     }
 }
 
@@ -936,7 +936,7 @@ fn normalize_email(value: &str) -> Result<String, OperationError> {
     };
     let email = value.trim_matches(is_whitespace).to_lowercase();
     if email.contains('\0') {
-        return Err(OperationError::new("invalid_input", 400));
+        return Err(OperationError::from_code("invalid_input", 400));
     }
     let parts: Vec<_> = email.split('@').collect();
     // Both sides of the JS pattern's domain separator also allow dots.
@@ -951,14 +951,14 @@ fn normalize_email(value: &str) -> Result<String, OperationError> {
         || email.chars().any(is_whitespace)
         || email.encode_utf16().count() > 320
     {
-        return Err(OperationError::new("invalid_input", 400));
+        return Err(OperationError::from_code("invalid_input", 400));
     }
     Ok(email)
 }
 
 fn validate_password(password: &str) -> Result<(), OperationError> {
     if password.chars().count() < 15 || password.len() > 1024 {
-        return Err(OperationError::new("invalid_input", 400));
+        return Err(OperationError::from_code("invalid_input", 400));
     }
     Ok(())
 }
@@ -984,7 +984,7 @@ impl SessionPolicy {
         if !(3_600..=31_536_000).contains(&idle_seconds)
             || absolute_seconds != 0 && !(3_600..=31_536_000).contains(&absolute_seconds)
         {
-            return Err(OperationError::new("invalid_session_policy", 500));
+            return Err(OperationError::from_code("invalid_session_policy", 500));
         }
         Ok(Self {
             idle_millis: idle_seconds as i64 * 1_000,

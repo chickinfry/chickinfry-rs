@@ -420,7 +420,7 @@ impl Repository {
     ) -> Result<R, OperationError> {
         self.update_optional(key, None, patch)
             .await?
-            .ok_or_else(|| OperationError::new("not_found", 404))
+            .ok_or_else(|| OperationError::from_code("not_found", 404))
     }
 
     pub async fn update_if<R: serde::de::DeserializeOwned>(
@@ -452,7 +452,7 @@ impl Repository {
         }
         self.update_matching(key, None, columns, &serde_json::json!({}))
             .await?
-            .ok_or_else(|| OperationError::new("not_found", 404))
+            .ok_or_else(|| OperationError::from_code("not_found", 404))
     }
 
     pub async fn increment_if<R: serde::de::DeserializeOwned>(
