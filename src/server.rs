@@ -25,6 +25,8 @@ pub struct RuntimeContext {
     pub headers: Vec<(String, String)>,
     pub session: Option<Session>,
     pub database: Option<DatabasePort>,
+    secrets: Secrets,
+    vault: Vault,
 }
 
 /// Project secrets resolved from the private binding frame. Missing values
@@ -44,12 +46,167 @@ impl Secrets {
     pub fn get(&self, name: &str) -> Result<String, OperationError> {
         self.values
             .get(name)
+            .filter(|value| !value.is_empty())
             .cloned()
             .ok_or_else(|| OperationError::new("service_unavailable", 503))
     }
 }
 
+/// One declared logical storage, routed per request through the shared host
+/// storage port. The customer module never sees binding credentials.
+#[derive(Clone)]
+pub struct Storage {
+    rid: u64,
+    name: String,
+}
+
+const STORAGE_OBJECT_LIMIT: usize = 4 << 20;
+
+impl Storage {
+    pub fn new(rid: u64, name: &str) -> Storage {
+        Storage {
+            rid,
+            name: name.to_string(),
+        }
+    }
+
+    /// Reads one object. A missing object is None; an unbound logical storage
+    /// is service_unavailable and every other failure is operation_failed.
+    pub async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, OperationError> {
+        match crate::host::storage(self.rid, "get", &self.name, key, None, None).await {
+            Ok(crate::host::StorageOutcome::Value(value)) => Ok(value),
+            Ok(crate::host::StorageOutcome::Error(code)) => Err(storage_error(&code)),
+            Ok(crate::host::StorageOutcome::Written) | Err(_) => Err(OperationError::internal()),
+        }
+    }
+
+    /// Writes one object with its content type. The public result is void.
+    pub async fn put(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        content_type: &str,
+    ) -> Result<(), OperationError> {
+        if bytes.len() > STORAGE_OBJECT_LIMIT {
+            return Err(OperationError::internal());
+        }
+        match crate::host::storage(
+            self.rid,
+            "put",
+            &self.name,
+            key,
+            Some(&bytes),
+            Some(content_type),
+        )
+        .await
+        {
+            Ok(crate::host::StorageOutcome::Written) => Ok(()),
+            Ok(crate::host::StorageOutcome::Error(code)) => Err(storage_error(&code)),
+            Ok(crate::host::StorageOutcome::Value(_)) | Err(_) => Err(OperationError::internal()),
+        }
+    }
+}
+
+fn storage_error(code: &str) -> OperationError {
+    if code == "service_unavailable" {
+        OperationError::new("service_unavailable", 503)
+    } else {
+        OperationError::internal()
+    }
+}
+
+/// The public log levels shared by every server language. Invalid levels
+/// cannot be expressed: the type only offers the four collected levels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Warn => "warn",
+            LogLevel::Error => "error",
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn log(level: LogLevel, message: &str, fields: Option<&serde_json::Value>) {
+    crate::logging::send(level.as_str(), message, fields);
+}
+
+/// Project-scoped vault snapshot delivered with the private binding frame.
+/// Scope or project mismatches surface as service_unavailable; a secret the
+/// snapshot does not carry is operation_failed.
+#[derive(Clone)]
+pub struct Vault {
+    scope: String,
+    project: String,
+    raw: Option<String>,
+}
+
+impl Vault {
+    fn from_config(config: &crate::RuntimeConfig) -> Vault {
+        Vault {
+            scope: config.vault_scope.clone().unwrap_or_default(),
+            project: config.project_id.clone().unwrap_or_default(),
+            raw: config.vault.clone(),
+        }
+    }
+
+    pub fn get(&self, secret_name: &str) -> Result<String, OperationError> {
+        let values = self.resolve()?;
+        values
+            .get(secret_name)
+            .cloned()
+            .ok_or_else(OperationError::internal)
+    }
+
+    fn resolve(&self) -> Result<std::collections::BTreeMap<String, String>, OperationError> {
+        let unavailable = || OperationError::new("service_unavailable", 503);
+        let raw = self.raw.as_deref().filter(|value| !value.is_empty());
+        if self.scope.is_empty() || self.project.is_empty() {
+            return Err(unavailable());
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_str(raw.ok_or_else(unavailable)?).map_err(|_| unavailable())?;
+        let object = parsed.as_object().ok_or_else(unavailable)?;
+        if object.get("projectId").and_then(serde_json::Value::as_str)
+            != Some(self.project.as_str())
+        {
+            return Err(unavailable());
+        }
+        if object.get("vault").and_then(serde_json::Value::as_str) != Some(self.scope.as_str()) {
+            return Err(unavailable());
+        }
+        let values = object
+            .get("values")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(unavailable)?;
+        let mut snapshot = std::collections::BTreeMap::new();
+        for (name, value) in values {
+            let value = value.as_str().ok_or_else(unavailable)?;
+            snapshot.insert(name.clone(), value.to_string());
+        }
+        Ok(snapshot)
+    }
+}
+
 impl RuntimeContext {
+    pub fn secrets(&self) -> Secrets {
+        self.secrets.clone()
+    }
+
+    pub fn vault(&self) -> Vault {
+        self.vault.clone()
+    }
+
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -247,6 +404,7 @@ pub fn write_output<T: serde::Serialize>(output: T) -> Result<serde_json::Value,
 
 #[derive(serde::Deserialize)]
 struct RequestMetadata {
+    config: Option<crate::RuntimeConfig>,
     id: Option<u64>,
     method: String,
     path: String,
@@ -380,7 +538,9 @@ async fn serve_inner<A: Application>(
     body: Vec<u8>,
     config: &crate::RuntimeConfig,
 ) -> Result<ResponseEnvelope, u16> {
-    let parsed: RequestMetadata = serde_json::from_slice(&metadata).map_err(|_| 500u16)?;
+    let mut parsed: RequestMetadata = serde_json::from_slice(&metadata).map_err(|_| 500u16)?;
+    let request_config = parsed.config.take();
+    let config = request_config.as_ref().unwrap_or(config);
     let rid = parsed
         .id
         .unwrap_or_else(|| NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed));
@@ -543,6 +703,10 @@ async fn serve_request<A: Application>(
         headers,
         session,
         database: config.database_url.as_ref().map(|_| DatabasePort::new(rid)),
+        secrets: Secrets {
+            values: config.secrets.clone(),
+        },
+        vault: Vault::from_config(config),
     };
     let context = A::Context::build(&runtime);
     match application.invoke(&context, &operation, input).await {
@@ -1210,6 +1374,137 @@ mod tests {
         > {
             unreachable!()
         }
+    }
+
+    fn vault(scope: &str, project: &str, raw: Option<&str>) -> Vault {
+        Vault {
+            scope: scope.to_string(),
+            project: project.to_string(),
+            raw: raw.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn empty_declared_secret_is_unavailable() {
+        let secrets = Secrets {
+            values: [("TOKEN".into(), String::new())].into(),
+        };
+        match secrets.get("TOKEN") {
+            Err(error) => {
+                assert_eq!(error.code, "service_unavailable");
+                assert_eq!(error.status, 503);
+            }
+            Ok(_) => panic!("empty secret was accepted"),
+        }
+    }
+
+    #[test]
+    fn vault_rejects_foreign_scope_project_and_missing_secrets() {
+        let raw = r#"{"projectId":"11111111-1111-4111-8111-111111111111","vault":"fixture","values":{"VALUE":"vault"}}"#;
+        let bound = vault("fixture", "11111111-1111-4111-8111-111111111111", Some(raw));
+        assert!(matches!(bound.get("VALUE"), Ok(value) if value == "vault"));
+        for rejected in [
+            vault("", "11111111-1111-4111-8111-111111111111", Some(raw)),
+            vault("fixture", "", Some(raw)),
+            vault("fixture", "11111111-1111-4111-8111-111111111111", None),
+            vault("fixture", "11111111-1111-4111-8111-111111111111", Some("")),
+            vault(
+                "fixture",
+                "11111111-1111-4111-8111-111111111111",
+                Some("not json"),
+            ),
+            vault("other", "11111111-1111-4111-8111-111111111111", Some(raw)),
+            vault("fixture", "22222222-2222-4222-8222-222222222222", Some(raw)),
+            vault(
+                "fixture",
+                "11111111-1111-4111-8111-111111111111",
+                Some(
+                    r#"{"projectId":"11111111-1111-4111-8111-111111111111","vault":"fixture","values":{"VALUE":1}}"#,
+                ),
+            ),
+        ] {
+            match rejected.get("VALUE") {
+                Err(error) => {
+                    assert_eq!(error.code, "service_unavailable");
+                    assert_eq!(error.status, 503);
+                }
+                Ok(value) => panic!("vault binding was accepted: {value}"),
+            }
+        }
+        match bound.get("MISSING") {
+            Err(error) => {
+                assert_eq!(error.code, "operation_failed");
+                assert_eq!(error.status, 500);
+            }
+            Ok(value) => panic!("missing vault secret was accepted: {value}"),
+        }
+    }
+
+    #[test]
+    fn storage_maps_host_outcomes_to_public_errors() {
+        crate::host::testing::run_storage(
+            |request| {
+                assert_eq!(request["name"], "assets");
+                match request["op"].as_str() {
+                    Some("get") if request["key"] == "missing" => {
+                        serde_json::json!({ "value": null })
+                    }
+                    Some("get") => serde_json::json!({ "value": [0, 255, 1] }),
+                    Some("put") => serde_json::json!({}),
+                    _ => unreachable!(),
+                }
+            },
+            async {
+                let storage = Storage::new(1, "assets");
+                match storage.get("object").await {
+                    Ok(value) => assert_eq!(value, Some(vec![0, 255, 1])),
+                    Err(error) => panic!("storage read failed: {} {}", error.code, error.status),
+                }
+                match storage.get("missing").await {
+                    Ok(value) => assert_eq!(value, None),
+                    Err(error) => panic!("storage read failed: {} {}", error.code, error.status),
+                }
+                match storage
+                    .put("object", vec![0, 255, 1], "application/octet-stream")
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(error) => panic!("storage write failed: {} {}", error.code, error.status),
+                }
+            },
+        );
+        for (script, code, status) in [
+            (
+                serde_json::json!({ "error": "service_unavailable" }),
+                "service_unavailable",
+                503,
+            ),
+            (
+                serde_json::json!({ "error": "operation_failed" }),
+                "operation_failed",
+                500,
+            ),
+        ] {
+            crate::host::testing::run_storage(move |_| script.clone(), async move {
+                match Storage::new(1, "assets").get("object").await {
+                    Err(error) => {
+                        assert_eq!(error.code, code);
+                        assert_eq!(error.status, status);
+                    }
+                    Ok(value) => panic!("storage host error was accepted: {value:?}"),
+                }
+            });
+        }
+        crate::host::testing::run_storage(
+            |_| unreachable!("oversized objects must not reach the storage host"),
+            async {
+                let error = Storage::new(1, "assets")
+                    .put("object", vec![0; (4 << 20) + 1], "application/octet-stream")
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code, "operation_failed");
+            },
+        );
     }
 
     #[test]

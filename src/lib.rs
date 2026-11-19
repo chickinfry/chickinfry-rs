@@ -36,22 +36,25 @@ pub use server::{DispatchError, InvalidInputError, OperationError, read_input, w
 
 use std::sync::OnceLock;
 
-/// Runtime configuration delivered once by the engine glue before the first
-/// request. Values arrive over the same private binding channel used by the
-/// other server languages; none of them are read from process environment.
+/// Runtime configuration delivered over the private engine binding channel.
 #[derive(Default, PartialEq, Eq, serde::Deserialize)]
 pub struct RuntimeConfig {
     #[serde(default, rename = "databaseUrl")]
     pub database_url: Option<String>,
     #[serde(default)]
     pub secrets: std::collections::BTreeMap<String, String>,
+    #[serde(default, rename = "vaultScope")]
+    pub vault_scope: Option<String>,
+    #[serde(default, rename = "projectId")]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub vault: Option<String>,
 }
 
 static CONFIG: OnceLock<RuntimeConfig> = OnceLock::new();
 
-/// Installs the runtime configuration. The engine glue calls this once after
-/// module initialization; later calls are ignored so a stale request cannot
-/// replace the binding set.
+/// Installs the fallback configuration for engine entries that supply bindings
+/// at startup. New entries provide the binding snapshot in each request.
 #[wasm_bindgen::prelude::wasm_bindgen(js_name = chikConfigure)]
 pub fn chik_configure(config: Vec<u8>) -> Result<(), wasm_bindgen::JsValue> {
     let parsed: RuntimeConfig = serde_json::from_slice(&config)

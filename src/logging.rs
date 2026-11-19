@@ -22,31 +22,41 @@ impl log::Log for Logger {
         if !self.enabled(record.metadata()) {
             return;
         }
-        CURRENT.with_borrow(|current| {
-            if let Some(current) = current {
-                let level = match record.level() {
-                    log::Level::Debug => "debug",
-                    log::Level::Info => "info",
-                    log::Level::Warn => "warn",
-                    log::Level::Error => "error",
-                    log::Level::Trace => return,
-                };
-                let frame = serde_json::json!({
-                    "rid": current.rid, "level": level, "message": record.args().to_string(),
-                });
-                if let Ok(bytes) = serde_json::to_vec(&frame) {
-                    if let Some(promise) = crate::host::start_log(bytes) {
-                        current
-                            .pending
-                            .borrow_mut()
-                            .push(wasm_bindgen_futures::JsFuture::from(promise));
-                    }
-                }
-            }
-        });
+        let level = match record.level() {
+            log::Level::Debug => "debug",
+            log::Level::Info => "info",
+            log::Level::Warn => "warn",
+            log::Level::Error => "error",
+            log::Level::Trace => return,
+        };
+        send(level, &record.args().to_string(), None);
     }
 
     fn flush(&self) {}
+}
+
+/// Sends one log event through the request-scoped host port. Outside a
+/// request the event is dropped, matching the standard facade, and host
+/// failures never surface to customer code.
+pub(crate) fn send(level: &str, message: &str, fields: Option<&serde_json::Value>) {
+    CURRENT.with_borrow(|current| {
+        let Some(current) = current else { return };
+        let mut frame = serde_json::Map::new();
+        frame.insert("rid".into(), serde_json::json!(current.rid));
+        frame.insert("level".into(), serde_json::json!(level));
+        frame.insert("message".into(), serde_json::json!(message));
+        if let Some(fields) = fields {
+            frame.insert("fields".into(), fields.clone());
+        }
+        if let Ok(bytes) = serde_json::to_vec(&serde_json::Value::Object(frame)) {
+            if let Some(promise) = crate::host::start_log(bytes) {
+                current
+                    .pending
+                    .borrow_mut()
+                    .push(wasm_bindgen_futures::JsFuture::from(promise));
+            }
+        }
+    });
 }
 
 // Request futures share one WASM thread; scope each poll so suspended requests cannot inherit another rid.
@@ -118,6 +128,40 @@ mod tests {
                 json!({"rid":7,"level":"info","message":"info"}),
                 json!({"rid":7,"level":"warn","message":"warn"}),
                 json!({"rid":7,"level":"error","message":"error"}),
+            ]
+        );
+    }
+    #[test]
+    fn request_log_sends_fields_and_swallows_host_failure() {
+        let frames = Rc::new(RefCell::new(Vec::new()));
+        let observed = frames.clone();
+        let output = testing::run(
+            move |frame| {
+                observed.borrow_mut().push(frame);
+                json!({"error":"log_failed"})
+            },
+            async {
+                let fields = json!({"order": "fixture-order", "count": 2});
+                scope(9, async {
+                    log::info!("standard");
+                    crate::server::log(
+                        crate::server::LogLevel::Warn,
+                        "context event",
+                        Some(&fields),
+                    );
+                    crate::server::log(crate::server::LogLevel::Info, "plain", None);
+                })
+                .await;
+                7
+            },
+        );
+        assert_eq!(output, 7);
+        assert_eq!(
+            *frames.borrow(),
+            vec![
+                json!({"rid":9,"level":"info","message":"standard"}),
+                json!({"rid":9,"level":"warn","message":"context event","fields":{"order":"fixture-order","count":2}}),
+                json!({"rid":9,"level":"info","message":"plain"}),
             ]
         );
     }
