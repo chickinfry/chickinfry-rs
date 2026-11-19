@@ -78,13 +78,14 @@ impl fmt::Display for OperationError {
 
 /// HttpTransport failures: local protocol and usage problems, and server-reported
 /// operation errors that preserve the wire error code and HTTP status.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ClientError {
     pub code: String,
     pub status: Option<u16>,
     pub outcome_unknown: bool,
     pub operation_error: Option<OperationError>,
     pub message: String,
+    pub(crate) cause: Option<Arc<dyn std::error::Error + Send + Sync>>,
 }
 
 impl ClientError {
@@ -95,6 +96,7 @@ impl ClientError {
             outcome_unknown,
             operation_error: None,
             message: code.into(),
+            cause: None,
         }
     }
 
@@ -142,7 +144,21 @@ impl ClientError {
             outcome_unknown: false,
             message: error.to_string(),
             operation_error: Some(error),
+            cause: None,
         }
+    }
+}
+
+impl fmt::Debug for ClientError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClientError")
+            .field("code", &self.code)
+            .field("status", &self.status)
+            .field("outcome_unknown", &self.outcome_unknown)
+            .field("operation_error", &self.operation_error)
+            .field("message", &self.message)
+            .finish_non_exhaustive()
     }
 }
 
@@ -175,7 +191,10 @@ impl fmt::Display for ClientError {
 
 impl std::error::Error for ClientError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.operation_error.as_ref().map(|error| error as _)
+        self.operation_error
+            .as_ref()
+            .map(|error| error as _)
+            .or_else(|| self.cause.as_deref().map(|error| error as _))
     }
 }
 
@@ -184,6 +203,11 @@ impl std::error::Error for OperationError {}
 /// Replaceable operation transport shared by generated service clients.
 pub trait Transport: Send + Sync {
     fn invoke(&self, operation: &str, input: &Value) -> Result<Value, ClientError>;
+
+    #[doc(hidden)]
+    fn realtime_renewal(&self, _renew: bool) -> Result<Option<Duration>, ClientError> {
+        Ok(None)
+    }
 
     /// Invokes an operation that permits a request without a session.
     #[doc(hidden)]
@@ -195,6 +219,29 @@ pub trait Transport: Send + Sync {
 impl Transport for HttpTransport {
     fn invoke(&self, operation: &str, input: &Value) -> Result<Value, ClientError> {
         HttpTransport::invoke(self, operation, input)
+    }
+
+    fn realtime_renewal(&self, renew: bool) -> Result<Option<Duration>, ClientError> {
+        let Some(store) = &self.session else {
+            return Ok(None);
+        };
+        let credentials = store.credentials();
+        let expires = chrono::DateTime::parse_from_rfc3339(&credentials.expires_at)
+            .map_err(|_| ClientError::new("unauthenticated", None, false))?;
+        let now = chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now());
+        let delay = expires
+            .signed_duration_since(now)
+            .to_std()
+            .unwrap_or_default()
+            .saturating_sub(Duration::from_secs(60));
+        if renew && delay.is_zero() {
+            let updated = self.refresh_session(store, &credentials)?;
+            if updated.expires_at == credentials.expires_at {
+                return Err(ClientError::new("internal", None, false));
+            }
+            return self.realtime_renewal(false);
+        }
+        Ok(Some(delay))
     }
 
     fn invoke_public(&self, operation: &str, input: &Value) -> Result<Value, ClientError> {

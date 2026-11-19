@@ -27,6 +27,8 @@ mod error_details;
 pub mod host;
 mod logging;
 pub mod orm;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod realtime;
 pub mod server;
 
 pub use serde;

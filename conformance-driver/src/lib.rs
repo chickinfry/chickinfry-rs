@@ -16,6 +16,9 @@ use chickinfry::client;
 use chickinfry::client::{ClientError, HttpTransport};
 use serde_json::{Value, json};
 
+#[cfg(feature = "realtime")]
+mod realtime;
+
 use protocol::{Error, Message, Request, Response, Result};
 use session::{Credentials, Store};
 
@@ -101,6 +104,8 @@ struct PendingState {
 }
 
 struct State<W> {
+    #[cfg(feature = "realtime")]
+    realtime: Mutex<Option<Arc<realtime::Trial>>>,
     output: Mutex<W>,
     refs: Arc<Credentials>,
     clients: Mutex<HashMap<String, Arc<Handle>>>,
@@ -122,12 +127,17 @@ fn capabilities() -> Vec<&'static str> {
     if cfg!(all(feature = "sdk", feature = "conformance")) {
         values.extend(["barrier", "session.trace", "client.transport"]);
     }
+    if cfg!(feature = "realtime") {
+        values.push("realtime-v1");
+    }
     values
 }
 
 impl<W: Write + Send + 'static> State<W> {
     fn new(output: W, refs: Arc<Credentials>) -> Self {
         Self {
+            #[cfg(feature = "realtime")]
+            realtime: Mutex::new(None),
             output: Mutex::new(output),
             refs,
             clients: Mutex::new(HashMap::new()),
@@ -193,6 +203,14 @@ impl<W: Write + Send + 'static> State<W> {
         match request.command.as_str() {
             "client.create" => {
                 let fixture = Fixture::read(args)?;
+                if args.get("transport").is_some()
+                    && (!cfg!(feature = "realtime")
+                        || protocol::string(args, "caseId")? != "RT-DX-01"
+                        || protocol::string(args, "transport")? != "plain"
+                        || !matches!(fixture, Fixture::Plain))
+                {
+                    return Err(Error::driver("invalid_args"));
+                }
                 let reference = protocol::reference(args, "clientRef")?;
                 if self.clients.lock().unwrap().contains_key(reference) {
                     return Err(Error::driver("protocol_violation"));
@@ -367,6 +385,28 @@ impl<W: Write + Send + 'static> State<W> {
                     let _ = after;
                     Err(Error::driver("unimplemented"))
                 }
+            }
+            #[cfg(feature = "realtime")]
+            "realtime.start" => {
+                let handle = self.client(protocol::reference(args, "clientRef")?)?;
+                let trial = realtime::Trial::new(handle);
+                let mut current = self.realtime.lock().unwrap();
+                if current.is_some() {
+                    return Err(Error::driver("invalid_args"));
+                }
+                let response = trial.start(args)?;
+                *current = Some(trial);
+                Ok(response)
+            }
+            #[cfg(feature = "realtime")]
+            name if name.starts_with("realtime.") => {
+                let trial = self
+                    .realtime
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .ok_or_else(|| Error::driver("invalid_reference"))?;
+                trial.command(name, args)
             }
             "client.call" => self.call(request),
             _ => Err(Error::driver("unimplemented")),
@@ -852,7 +892,20 @@ fn validate(request: &Request) -> Result<()> {
             "bearerRef",
             "requestTimeoutMs",
             "fixture",
+            "transport",
         ],
+        #[cfg(feature = "realtime")]
+        "realtime.start" => &["clientRef", "channel", "onGap", "eventHandler", "transport"],
+        #[cfg(feature = "realtime")]
+        "realtime.observe" => &["point", "observation"],
+        #[cfg(feature = "realtime")]
+        "realtime.release" => &["point"],
+        #[cfg(feature = "realtime")]
+        "realtime.unsubscribe"
+        | "realtime.cancel"
+        | "realtime.second-consumer"
+        | "realtime.hold-dispatch"
+        | "realtime.release-dispatch" => &[],
         "client.copy" => &["sourceClientRef", "clientRef", "bearerRef"],
         "client.call" => &["clientRef", "operation", "input", "inputRefs", "outputRefs"],
         "client.observe" => &["callId", "afterSequence"],
@@ -884,9 +937,13 @@ fn handshake(args: &Value) -> Result<Value> {
     if versions.iter().any(|v| v.as_u64().is_none()) {
         return Err(Error::driver("invalid_args"));
     }
-    if !versions.contains(&json!(1)) {
+    let version = if cfg!(feature = "realtime") && versions.contains(&json!(2)) {
+        2
+    } else if versions.contains(&json!(1)) {
+        1
+    } else {
         return Err(Error::driver("protocol_mismatch"));
-    }
+    };
     protocol::reference(args, "runId")?;
     let required = args
         .get("requiredCapabilities")
@@ -902,7 +959,7 @@ fn handshake(args: &Value) -> Result<Value> {
         }
     }
     Ok(
-        json!({"protocolVersion": 1, "driverVersion": env!("CARGO_PKG_VERSION"), "capabilities": capabilities}),
+        json!({"protocolVersion": version, "driverVersion": env!("CARGO_PKG_VERSION"), "capabilities": capabilities}),
     )
 }
 
@@ -961,9 +1018,10 @@ pub fn run<R: BufRead, W: Write + Send + 'static>(
                         return Err(Error::driver("protocol_violation"));
                     }
                     case.get_or_insert_with(|| case_id.to_owned());
-                    if request.command == "client.call" {
+                    if request.command == "client.call" || request.command.starts_with("realtime.")
+                    {
                         #[cfg(feature = "conformance")]
-                        {
+                        if request.command == "client.call" {
                             let handle =
                                 state.client(protocol::reference(&request.args, "clientRef")?)?;
                             state
@@ -998,6 +1056,10 @@ pub fn run<R: BufRead, W: Write + Send + 'static>(
         Ok(())
     })();
     state.cancel();
+    #[cfg(feature = "realtime")]
+    if let Some(trial) = state.realtime.lock().unwrap().take() {
+        trial.stop(true);
+    }
     for worker in workers {
         if worker.join().is_err() {
             state.failed.store(true, Ordering::SeqCst);
@@ -1051,18 +1113,20 @@ fn transport_error_allowlist_matches_runtime_messages() {
     );
     assert_eq!(sdk_error(error).raw_transport_details, Some(false));
     assert_eq!(
-        sdk_error(ClientError {
-            message: "synthetic-unlisted-marker".into(),
-            ..ClientError::new("unknown", None, false)
+        sdk_error({
+            let mut error = ClientError::new("unknown", None, false);
+            error.message = "synthetic-unlisted-marker".into();
+            error
         })
         .raw_transport_details,
         Some(true)
     );
     // A safe message followed by extra text must not pass as safe; only exact matches are allowed.
     assert_eq!(
-        sdk_error(ClientError {
-            message: "Could not read the response. Confirm the operation outcome before trying again. synthetic-suffix-marker".into(),
-            ..ClientError::new("unavailable", Some(200), true)
+        sdk_error({
+            let mut error = ClientError::new("unavailable", Some(200), true);
+            error.message = "Could not read the response. Confirm the operation outcome before trying again. synthetic-suffix-marker".into();
+            error
         })
         .raw_transport_details,
         Some(true)
