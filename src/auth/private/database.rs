@@ -178,6 +178,202 @@ impl AppAuthActionTokensRepository {
     }
 }
 
+static APP_AUTH_DEVICE_REQUESTS_TABLE: TableDefinition = TableDefinition::new(
+    "app_auth_device_requests",
+    &["id", ],
+    &[
+        Column::new("approved_at", Kind::Timestamp, true, true, false, ""),
+        Column::new("consumed_at", Kind::Timestamp, true, true, false, ""),
+        Column::new("created_at", Kind::Timestamp, false, true, false, ""),
+        Column::new("device_code_hash", Kind::Text, false, false, true, ""),
+        Column::new("device_name", Kind::Text, true, true, false, ""),
+        Column::new("expires_at", Kind::Timestamp, false, false, false, ""),
+        Column::new("id", Kind::Id, false, true, false, ""),
+        Column::new("last_polled_at", Kind::Timestamp, true, true, false, ""),
+        Column::new("status", Kind::Text, false, true, false, ""),
+        Column::new("user_code_hash", Kind::Text, false, false, true, ""),
+        Column::new("user_id", Kind::Id, true, true, false, "app_auth_users.id"),
+    ],
+);
+
+#[derive(Debug, Clone, chickinfry::serde::Serialize, chickinfry::serde::Deserialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthDeviceRequestsRow {
+    pub approved_at: Option<String>,
+    pub consumed_at: Option<String>,
+    pub created_at: String,
+    pub device_code_hash: String,
+    pub device_name: Option<String>,
+    pub expires_at: String,
+    pub id: String,
+    pub last_polled_at: Option<String>,
+    pub status: String,
+    pub user_code_hash: String,
+    pub user_id: Option<String>,
+}
+
+#[derive(Debug, chickinfry::serde::Serialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthDeviceRequestsInsert {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approved_at: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consumed_at: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    pub device_code_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<Option<String>>,
+    pub expires_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_polled_at: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    pub user_code_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<Option<String>>,
+}
+
+/// The patch for one primary-key-addressed row. Primary-key columns are
+/// absent, so updates can never move a row identity.
+#[derive(Debug, Default, chickinfry::serde::Serialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthDeviceRequestsUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approved_at: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consumed_at: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_code_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_polled_at: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_code_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<Option<String>>,
+}
+
+#[derive(Debug, Default, chickinfry::serde::Serialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthDeviceRequestsIncrement {
+}
+
+#[derive(Debug, chickinfry::serde::Deserialize, chickinfry::serde::Serialize)]
+#[serde(crate = "chickinfry::serde")]
+pub struct AppAuthDeviceRequestsPrimaryKey {
+    pub id: String,
+}
+
+pub struct AppAuthDeviceRequestsRepository(chickinfry::orm::Repository);
+
+pub struct AppAuthDeviceRequestsColumns {
+    pub approved_at: Column,
+    pub consumed_at: Column,
+    pub created_at: Column,
+    pub device_code_hash: Column,
+    pub device_name: Column,
+    pub expires_at: Column,
+    pub id: Column,
+    pub last_polled_at: Column,
+    pub status: Column,
+    pub user_code_hash: Column,
+    pub user_id: Column,
+}
+
+impl AppAuthDeviceRequestsRepository {
+
+    pub fn columns(&self) -> AppAuthDeviceRequestsColumns {
+        AppAuthDeviceRequestsColumns {
+            approved_at: Column::new("approved_at", Kind::Timestamp, true, true, false, ""),
+            consumed_at: Column::new("consumed_at", Kind::Timestamp, true, true, false, ""),
+            created_at: Column::new("created_at", Kind::Timestamp, false, true, false, ""),
+            device_code_hash: Column::new("device_code_hash", Kind::Text, false, false, true, ""),
+            device_name: Column::new("device_name", Kind::Text, true, true, false, ""),
+            expires_at: Column::new("expires_at", Kind::Timestamp, false, false, false, ""),
+            id: Column::new("id", Kind::Id, false, true, false, ""),
+            last_polled_at: Column::new("last_polled_at", Kind::Timestamp, true, true, false, ""),
+            status: Column::new("status", Kind::Text, false, true, false, ""),
+            user_code_hash: Column::new("user_code_hash", Kind::Text, false, false, true, ""),
+            user_id: Column::new("user_id", Kind::Id, true, true, false, "app_auth_users.id"),
+        }
+    }
+    pub(crate) fn new(repository: chickinfry::orm::Repository) -> Self {
+        Self(repository)
+    }
+
+    pub async fn insert(&self, insert: AppAuthDeviceRequestsInsert) -> Result<AppAuthDeviceRequestsRow, OperationError> {
+        let value = chickinfry::serde_json::to_value(&insert)
+            .map_err(|_| OperationError::internal())?;
+        self.0.insert(&value).await
+    }
+
+    pub async fn find_by_id(&self, key: AppAuthDeviceRequestsPrimaryKey) -> Result<Option<AppAuthDeviceRequestsRow>, OperationError> {
+        let value = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        self.0.find_by_id(&value).await
+    }
+
+    pub async fn upsert(&self, insert: AppAuthDeviceRequestsInsert) -> Result<AppAuthDeviceRequestsRow, OperationError> {
+        let value = chickinfry::serde_json::to_value(&insert)
+            .map_err(|_| OperationError::internal())?;
+        self.0.upsert(&value).await
+    }
+
+    pub async fn increment(&self, key: AppAuthDeviceRequestsPrimaryKey, columns: AppAuthDeviceRequestsIncrement) -> Result<AppAuthDeviceRequestsRow, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let columns = chickinfry::serde_json::to_value(&columns)
+            .map_err(|_| OperationError::internal())?;
+        self.0.increment(&key, &columns).await
+    }
+
+    pub async fn increment_if(&self, key: AppAuthDeviceRequestsPrimaryKey, condition: chickinfry::orm::Filter, columns: AppAuthDeviceRequestsIncrement, patch: AppAuthDeviceRequestsUpdate) -> Result<Option<AppAuthDeviceRequestsRow>, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let columns = chickinfry::serde_json::to_value(&columns)
+            .map_err(|_| OperationError::internal())?;
+        let patch = chickinfry::serde_json::to_value(&patch)
+            .map_err(|_| OperationError::internal())?;
+        self.0.increment_if(&key, &condition, &columns, &patch).await
+    }
+
+    pub async fn find_many(&self, options: FindMany) -> Result<Vec<AppAuthDeviceRequestsRow>, OperationError> {
+        self.0.find_many(options).await
+    }
+
+    pub async fn update(&self, key: AppAuthDeviceRequestsPrimaryKey, patch: AppAuthDeviceRequestsUpdate) -> Result<AppAuthDeviceRequestsRow, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let patch = chickinfry::serde_json::to_value(&patch)
+            .map_err(|_| OperationError::internal())?;
+        self.0.update(&key, &patch).await
+    }
+
+    pub async fn update_if(&self, key: AppAuthDeviceRequestsPrimaryKey, filter: chickinfry::orm::Filter, patch: AppAuthDeviceRequestsUpdate) -> Result<Option<AppAuthDeviceRequestsRow>, OperationError> {
+        let key = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        let patch = chickinfry::serde_json::to_value(&patch)
+            .map_err(|_| OperationError::internal())?;
+        self.0.update_if(&key, &filter, &patch).await
+    }
+
+    pub async fn delete(&self, key: AppAuthDeviceRequestsPrimaryKey) -> Result<bool, OperationError> {
+        let value = chickinfry::serde_json::to_value(&key)
+            .map_err(|_| OperationError::internal())?;
+        self.0.delete(&value).await
+    }
+}
+
 static APP_AUTH_IDENTITIES_TABLE: TableDefinition = TableDefinition::new(
     "app_auth_identities",
     &["provider", "subject", ],
@@ -1493,6 +1689,7 @@ impl AppAuthUsersRepository {
 pub struct Database {
     _port: chickinfry::database::DatabasePort,
     pub app_auth_action_tokens: AppAuthActionTokensRepository,
+    pub app_auth_device_requests: AppAuthDeviceRequestsRepository,
     pub app_auth_identities: AppAuthIdentitiesRepository,
     pub app_auth_invites: AppAuthInvitesRepository,
     pub app_auth_migrations: AppAuthMigrationsRepository,
@@ -1508,6 +1705,7 @@ impl Database {
         Database {
             _port: port,
             app_auth_action_tokens: AppAuthActionTokensRepository::new(Repository::new(&APP_AUTH_ACTION_TOKENS_TABLE, port)),
+            app_auth_device_requests: AppAuthDeviceRequestsRepository::new(Repository::new(&APP_AUTH_DEVICE_REQUESTS_TABLE, port)),
             app_auth_identities: AppAuthIdentitiesRepository::new(Repository::new(&APP_AUTH_IDENTITIES_TABLE, port)),
             app_auth_invites: AppAuthInvitesRepository::new(Repository::new(&APP_AUTH_INVITES_TABLE, port)),
             app_auth_migrations: AppAuthMigrationsRepository::new(Repository::new(&APP_AUTH_MIGRATIONS_TABLE, port)),
@@ -1523,6 +1721,7 @@ impl Database {
         TransactionDatabase {
             _port: port,
             app_auth_action_tokens: AppAuthActionTokensRepository::new(Repository::transactional(&APP_AUTH_ACTION_TOKENS_TABLE, Connection::Transactional(port))),
+            app_auth_device_requests: AppAuthDeviceRequestsRepository::new(Repository::transactional(&APP_AUTH_DEVICE_REQUESTS_TABLE, Connection::Transactional(port))),
             app_auth_identities: AppAuthIdentitiesRepository::new(Repository::transactional(&APP_AUTH_IDENTITIES_TABLE, Connection::Transactional(port))),
             app_auth_invites: AppAuthInvitesRepository::new(Repository::transactional(&APP_AUTH_INVITES_TABLE, Connection::Transactional(port))),
             app_auth_migrations: AppAuthMigrationsRepository::new(Repository::transactional(&APP_AUTH_MIGRATIONS_TABLE, Connection::Transactional(port))),
@@ -1545,6 +1744,7 @@ impl Database {
         let mut database = TransactionDatabase {
             _port: lease,
             app_auth_action_tokens: AppAuthActionTokensRepository::new(Repository::transactional(&APP_AUTH_ACTION_TOKENS_TABLE, Connection::Transactional(lease))),
+            app_auth_device_requests: AppAuthDeviceRequestsRepository::new(Repository::transactional(&APP_AUTH_DEVICE_REQUESTS_TABLE, Connection::Transactional(lease))),
             app_auth_identities: AppAuthIdentitiesRepository::new(Repository::transactional(&APP_AUTH_IDENTITIES_TABLE, Connection::Transactional(lease))),
             app_auth_invites: AppAuthInvitesRepository::new(Repository::transactional(&APP_AUTH_INVITES_TABLE, Connection::Transactional(lease))),
             app_auth_migrations: AppAuthMigrationsRepository::new(Repository::transactional(&APP_AUTH_MIGRATIONS_TABLE, Connection::Transactional(lease))),
@@ -1570,6 +1770,7 @@ impl Database {
 pub struct TransactionDatabase {
     _port: TransactionPort,
     pub app_auth_action_tokens: AppAuthActionTokensRepository,
+    pub app_auth_device_requests: AppAuthDeviceRequestsRepository,
     pub app_auth_identities: AppAuthIdentitiesRepository,
     pub app_auth_invites: AppAuthInvitesRepository,
     pub app_auth_migrations: AppAuthMigrationsRepository,
