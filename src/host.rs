@@ -11,6 +11,8 @@ unsafe extern "C" {
     pub safe fn db(request: Vec<u8>) -> js_sys::Promise;
     #[wasm_bindgen(catch, js_namespace = __chik, js_name = log)]
     safe fn host_log(request: Vec<u8>) -> Result<js_sys::Promise, wasm_bindgen::JsValue>;
+    #[wasm_bindgen(catch, js_namespace = __chik, js_name = realtime)]
+    safe fn host_realtime(request: Vec<u8>) -> Result<js_sys::Promise, wasm_bindgen::JsValue>;
     #[wasm_bindgen(catch, js_namespace = __chik, js_name = storage)]
     safe fn host_storage(
         rid: u64,
@@ -164,6 +166,18 @@ fn read_storage_outcome(
     }
 }
 
+/// Sends one realtime frame through the shared host realtime port and returns
+/// its JSON reply: {} once the engine confirmed, or {error, status?}.
+#[cfg(not(all(test, not(target_arch = "wasm32"))))]
+pub(crate) async fn realtime(frame: Vec<u8>) -> Result<serde_json::Value, String> {
+    let promise = host_realtime(frame).map_err(format_host_rejection)?;
+    let value = wasm_bindgen_futures::JsFuture::from(promise)
+        .await
+        .map_err(format_host_rejection)?;
+    let bytes = js_sys::Uint8Array::from(value).to_vec();
+    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+}
+
 /// Cryptographically strong random bytes from the host. Used for opaque
 /// session and refresh tokens; only their digests are ever persisted.
 pub fn random_bytes(length: usize) -> Result<Vec<u8>, String> {
@@ -222,6 +236,12 @@ pub(crate) async fn storage(
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) async fn realtime(frame: Vec<u8>) -> Result<serde_json::Value, String> {
+    let request = serde_json::from_slice(&frame).map_err(|error| error.to_string())?;
+    Ok(testing::storage_respond(request))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) mod testing {
     use serde_json::Value;
     use std::{cell::RefCell, future::Future, task::Context};
@@ -246,8 +266,8 @@ pub(crate) mod testing {
             .with_borrow_mut(|handler| handler.as_mut().expect("no scripted storage host")(request))
     }
 
-    /// Runs one future against a scripted storage host. The handler receives
-    /// the routed frame and returns {value: bytes | null}, {}, or {error}.
+    /// Runs one future against a scripted storage or realtime host. The
+    /// handler receives the routed frame and returns the host reply.
     pub(crate) fn run_storage<T>(
         handler: impl FnMut(Value) -> Value + 'static,
         future: impl Future<Output = T>,

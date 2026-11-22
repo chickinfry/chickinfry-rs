@@ -86,6 +86,66 @@ impl Storage {
     }
 }
 
+/// Publishes realtime events through the shared host realtime port. The
+/// engine binding and its credentials stay in the host.
+#[derive(Clone)]
+pub struct Realtime {
+    rid: u64,
+}
+
+impl Realtime {
+    pub fn new(rid: u64) -> Realtime {
+        Realtime { rid }
+    }
+
+    /// Publishes one event on a channel and resolves without a result value
+    /// once the engine confirmed it. Engine rejections keep their public code
+    /// and status; an unconfirmed outcome is realtime_publish_outcome_unknown.
+    pub async fn publish<T: serde::Serialize + ?Sized>(
+        &self,
+        channel: &str,
+        payload: &T,
+    ) -> Result<(), OperationError> {
+        let frame = serde_json::to_value(payload).and_then(|payload| {
+            serde_json::to_vec(&serde_json::json!({
+                "rid": self.rid,
+                "op": "publish",
+                "input": { "channel": channel, "payload": payload },
+            }))
+        });
+        let Ok(frame) = frame else {
+            return Err(OperationError::internal());
+        };
+        // A call the host never accepted was not sent, so it is a plain failure.
+        match crate::host::realtime(frame).await {
+            Ok(reply) => realtime_result(&reply),
+            Err(_) => Err(OperationError::internal()),
+        }
+    }
+}
+
+fn realtime_result(reply: &serde_json::Value) -> Result<(), OperationError> {
+    let Some(reply) = reply.as_object() else {
+        return Err(OperationError::internal());
+    };
+    match (reply.get("error"), reply.get("status")) {
+        (None, None) if reply.is_empty() => Ok(()),
+        (Some(serde_json::Value::String(code)), None) if code == "binding_unavailable" => {
+            Err(OperationError::from_code("service_unavailable", 503))
+        }
+        (Some(serde_json::Value::String(code)), Some(status)) if reply.len() == 2 => {
+            match status
+                .as_u64()
+                .and_then(|status| u16::try_from(status).ok())
+            {
+                Some(status) => Err(OperationError::from_code(code, status)),
+                None => Err(OperationError::internal()),
+            }
+        }
+        _ => Err(OperationError::internal()),
+    }
+}
+
 fn storage_error(code: &str) -> OperationError {
     if code == "service_unavailable" {
         OperationError::from_code("service_unavailable", 503)
@@ -1645,6 +1705,72 @@ mod tests {
                 assert_eq!(error.status, 500);
             }
             Ok(value) => panic!("missing vault secret was accepted: {value}"),
+        }
+    }
+
+    #[test]
+    fn realtime_publish_maps_host_outcomes_to_public_errors() {
+        crate::host::testing::run_storage(
+            |request| {
+                assert_eq!(
+                    request,
+                    serde_json::json!({
+                        "rid": 7,
+                        "op": "publish",
+                        "input": { "channel": "orders", "payload": { "id": "A", "items": [1, 2] } },
+                    })
+                );
+                serde_json::json!({})
+            },
+            async {
+                let payload = serde_json::json!({ "id": "A", "items": [1, 2] });
+                if let Err(error) = Realtime::new(7).publish("orders", &payload).await {
+                    panic!("realtime publish failed: {} {}", error.code, error.status);
+                }
+            },
+        );
+        for (script, code, status) in [
+            (
+                serde_json::json!({ "error": "binding_unavailable" }),
+                "service_unavailable",
+                503,
+            ),
+            (
+                serde_json::json!({ "error": "unauthorized_project", "status": 403 }),
+                "unauthorized_project",
+                403,
+            ),
+            (
+                serde_json::json!({ "error": "realtime_publish_outcome_unknown", "status": 503 }),
+                "realtime_publish_outcome_unknown",
+                503,
+            ),
+            (
+                serde_json::json!({ "error": "invalid_host_call" }),
+                "operation_failed",
+                500,
+            ),
+            (
+                serde_json::json!({ "error": "Bad_Code", "status": 403 }),
+                "operation_failed",
+                500,
+            ),
+            (
+                serde_json::json!({ "error": "unauthorized_project", "status": 200 }),
+                "operation_failed",
+                500,
+            ),
+            (serde_json::json!({ "ok": true }), "operation_failed", 500),
+        ] {
+            crate::host::testing::run_storage(move |_| script.clone(), async move {
+                match Realtime::new(1).publish("orders", &1).await {
+                    Err(error) => {
+                        assert_eq!(error.code, code);
+                        assert_eq!(error.status, status);
+                    }
+                    Ok(()) => panic!("realtime host reply was accepted as confirmed"),
+                }
+            });
         }
     }
 
