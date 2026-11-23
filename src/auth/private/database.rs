@@ -171,7 +171,7 @@ impl AppAuthActionTokensRepository {
         self.0.update_if(&key, &filter, &patch).await
     }
 
-    pub async fn delete(&self, key: AppAuthActionTokensPrimaryKey) -> Result<bool, OperationError> {
+    pub async fn delete(&self, key: AppAuthActionTokensPrimaryKey) -> Result<Option<AppAuthActionTokensRow>, OperationError> {
         let value = chickinfry::serde_json::to_value(&key)
             .map_err(|_| OperationError::internal())?;
         self.0.delete(&value).await
@@ -367,7 +367,7 @@ impl AppAuthDeviceRequestsRepository {
         self.0.update_if(&key, &filter, &patch).await
     }
 
-    pub async fn delete(&self, key: AppAuthDeviceRequestsPrimaryKey) -> Result<bool, OperationError> {
+    pub async fn delete(&self, key: AppAuthDeviceRequestsPrimaryKey) -> Result<Option<AppAuthDeviceRequestsRow>, OperationError> {
         let value = chickinfry::serde_json::to_value(&key)
             .map_err(|_| OperationError::internal())?;
         self.0.delete(&value).await
@@ -506,7 +506,7 @@ impl AppAuthIdentitiesRepository {
         self.0.update_if(&key, &filter, &patch).await
     }
 
-    pub async fn delete(&self, key: AppAuthIdentitiesPrimaryKey) -> Result<bool, OperationError> {
+    pub async fn delete(&self, key: AppAuthIdentitiesPrimaryKey) -> Result<Option<AppAuthIdentitiesRow>, OperationError> {
         let value = chickinfry::serde_json::to_value(&key)
             .map_err(|_| OperationError::internal())?;
         self.0.delete(&value).await
@@ -685,7 +685,7 @@ impl AppAuthInvitesRepository {
         self.0.update_if(&key, &filter, &patch).await
     }
 
-    pub async fn delete(&self, key: AppAuthInvitesPrimaryKey) -> Result<bool, OperationError> {
+    pub async fn delete(&self, key: AppAuthInvitesPrimaryKey) -> Result<Option<AppAuthInvitesRow>, OperationError> {
         let value = chickinfry::serde_json::to_value(&key)
             .map_err(|_| OperationError::internal())?;
         self.0.delete(&value).await
@@ -838,7 +838,7 @@ impl AppAuthMigrationsRepository {
         self.0.update_if(&key, &filter, &patch).await
     }
 
-    pub async fn delete(&self, key: AppAuthMigrationsPrimaryKey) -> Result<bool, OperationError> {
+    pub async fn delete(&self, key: AppAuthMigrationsPrimaryKey) -> Result<Option<AppAuthMigrationsRow>, OperationError> {
         let value = chickinfry::serde_json::to_value(&key)
             .map_err(|_| OperationError::internal())?;
         self.0.delete(&value).await
@@ -978,7 +978,7 @@ impl AppAuthRateLimitsRepository {
         self.0.update_if(&key, &filter, &patch).await
     }
 
-    pub async fn delete(&self, key: AppAuthRateLimitsPrimaryKey) -> Result<bool, OperationError> {
+    pub async fn delete(&self, key: AppAuthRateLimitsPrimaryKey) -> Result<Option<AppAuthRateLimitsRow>, OperationError> {
         let value = chickinfry::serde_json::to_value(&key)
             .map_err(|_| OperationError::internal())?;
         self.0.delete(&value).await
@@ -1134,7 +1134,7 @@ impl AppAuthRefreshTokensRepository {
         self.0.update_if(&key, &filter, &patch).await
     }
 
-    pub async fn delete(&self, key: AppAuthRefreshTokensPrimaryKey) -> Result<bool, OperationError> {
+    pub async fn delete(&self, key: AppAuthRefreshTokensPrimaryKey) -> Result<Option<AppAuthRefreshTokensRow>, OperationError> {
         let value = chickinfry::serde_json::to_value(&key)
             .map_err(|_| OperationError::internal())?;
         self.0.delete(&value).await
@@ -1323,7 +1323,7 @@ impl AppAuthSessionsRepository {
         self.0.update_if(&key, &filter, &patch).await
     }
 
-    pub async fn delete(&self, key: AppAuthSessionsPrimaryKey) -> Result<bool, OperationError> {
+    pub async fn delete(&self, key: AppAuthSessionsPrimaryKey) -> Result<Option<AppAuthSessionsRow>, OperationError> {
         let value = chickinfry::serde_json::to_value(&key)
             .map_err(|_| OperationError::internal())?;
         self.0.delete(&value).await
@@ -1511,7 +1511,7 @@ impl AppAuthSignupRequestsRepository {
         self.0.update_if(&key, &filter, &patch).await
     }
 
-    pub async fn delete(&self, key: AppAuthSignupRequestsPrimaryKey) -> Result<bool, OperationError> {
+    pub async fn delete(&self, key: AppAuthSignupRequestsPrimaryKey) -> Result<Option<AppAuthSignupRequestsRow>, OperationError> {
         let value = chickinfry::serde_json::to_value(&key)
             .map_err(|_| OperationError::internal())?;
         self.0.delete(&value).await
@@ -1679,7 +1679,7 @@ impl AppAuthUsersRepository {
         self.0.update_if(&key, &filter, &patch).await
     }
 
-    pub async fn delete(&self, key: AppAuthUsersPrimaryKey) -> Result<bool, OperationError> {
+    pub async fn delete(&self, key: AppAuthUsersPrimaryKey) -> Result<Option<AppAuthUsersRow>, OperationError> {
         let value = chickinfry::serde_json::to_value(&key)
             .map_err(|_| OperationError::internal())?;
         self.0.delete(&value).await

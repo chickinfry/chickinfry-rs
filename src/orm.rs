@@ -531,7 +531,10 @@ impl Repository {
         Ok(self.many(&sql, &params).await?.into_iter().next())
     }
 
-    pub async fn delete(&self, key: &serde_json::Value) -> Result<bool, OperationError> {
+    pub async fn delete<R: serde::de::DeserializeOwned>(
+        &self,
+        key: &serde_json::Value,
+    ) -> Result<Option<R>, OperationError> {
         let (where_clause, params) = self.primary_key_filter(key, 0)?;
         let sql = format!(
             "delete from {} where {} returning {}",
@@ -539,8 +542,7 @@ impl Repository {
             where_clause,
             self.table.select_list()?
         );
-        let rows = self.connection.query(&sql, &params).await?;
-        Ok(!rows.is_empty())
+        Ok(self.many(&sql, &params).await?.into_iter().next())
     }
 
     fn primary_key_filter(
