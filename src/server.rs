@@ -330,9 +330,39 @@ impl OperationError {
         }
     }
 
-    pub(crate) fn from_code(code: &str, status: u16) -> Self {
+    /// Creates a custom operation error without response details.
+    pub fn from_code(code: &str, status: u16) -> Self {
         Self::new(code, status, None, Vec::new())
     }
+
+    // BEGIN generated operation errors
+
+    /// Creates the `not_found` operation error.
+    pub fn not_found() -> Self {
+        Self::from_code("not_found", 404)
+    }
+
+    /// Creates the `invalid_input` operation error.
+    pub fn invalid_input() -> Self {
+        Self::from_code("invalid_input", 400)
+    }
+
+    /// Creates the `conflict` operation error.
+    pub fn conflict() -> Self {
+        Self::from_code("conflict", 409)
+    }
+
+    /// Creates the `forbidden` operation error.
+    pub fn forbidden() -> Self {
+        Self::from_code("forbidden", 403)
+    }
+
+    /// Creates the `not_implemented` operation error.
+    pub fn not_implemented() -> Self {
+        Self::from_code("not_implemented", 501)
+    }
+
+    // END generated operation errors
 
     /// Generic internal failure. Internal details never reach the wire.
     pub fn internal() -> Self {
