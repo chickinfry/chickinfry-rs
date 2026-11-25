@@ -4,8 +4,9 @@
 //! parameters.
 
 use crate::database::{DatabasePort, TransactionPort};
+use crate::date_time::{parse_postgres_timestamp, parse_rfc3339};
 use crate::server::OperationError;
-use chrono::{DateTime, Datelike, Utc};
+use time::{Date, OffsetDateTime, UtcOffset, macros::format_description};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -605,9 +606,12 @@ impl Repository {
             if column.kind == Kind::Timestamp && !value.is_null() {
                 let text = value.as_str().ok_or_else(OperationError::internal)?;
                 let timestamp = parse_timestamp(text, true)?;
-                let utc = timestamp.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
-                let (whole, fraction) = utc.split_once('.').ok_or_else(OperationError::internal)?;
-                let micros = &fraction[..6];
+                let utc = timestamp
+                    .format(format_description!(
+                        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6]"
+                    ))
+                    .map_err(|_| OperationError::internal())?;
+                let (whole, micros) = utc.split_once('.').ok_or_else(OperationError::internal)?;
                 let digits = micros.trim_end_matches('0').len().max(3);
                 *value = serde_json::Value::String(format!("{whole}.{}Z", &micros[..digits]));
             }
@@ -703,21 +707,21 @@ fn join_filters(
     Ok(format!("({})", compiled.join(separator)))
 }
 
-fn parse_timestamp(text: &str, postgres: bool) -> Result<DateTime<Utc>, OperationError> {
+fn parse_timestamp(text: &str, postgres: bool) -> Result<OffsetDateTime, OperationError> {
     if let Some((_, decimal)) = text.split_once('.')
         && decimal.bytes().take_while(u8::is_ascii_digit).count() > 6
     {
         return Err(OperationError::internal());
     }
-    let parsed = DateTime::parse_from_rfc3339(text).or_else(|error| {
-        if postgres {
-            DateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f%#z")
-        } else {
-            Err(error)
-        }
-    });
-    let timestamp = parsed.map_err(|_| OperationError::internal())?;
-    let utc = timestamp.to_utc();
+    let timestamp = if postgres {
+        parse_postgres_timestamp(text)
+    } else {
+        parse_rfc3339(text)
+    }
+    .ok_or_else(OperationError::internal)?;
+    let utc = timestamp
+        .checked_to_offset(UtcOffset::UTC)
+        .ok_or_else(OperationError::internal)?;
     if !(1..=9999).contains(&timestamp.year()) || !(1..=9999).contains(&utc.year()) {
         return Err(OperationError::internal());
     }
@@ -765,9 +769,9 @@ fn encode_value(
                     return Err(OperationError::internal());
                 }
                 Kind::Date => {
-                    let date = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
+                    let date = Date::parse(text, format_description!("[year]-[month]-[day]"))
                         .map_err(|_| OperationError::internal())?;
-                    if date.format("%Y-%m-%d").to_string() != text {
+                    if date.to_string() != text {
                         return Err(OperationError::internal());
                     }
                 }
@@ -833,13 +837,37 @@ mod tests {
             )],
         );
         let repository = Repository::new(&DATES, DatabasePort::new(1));
-        let row = json!({"seen_at": "2026-01-02 12:04:05.123450+09"});
-        let decoded: Value = repository
-            .decode_row(row.as_object().unwrap().clone())
-            .ok()
-            .unwrap();
-        assert_eq!(decoded["seen_at"], "2026-01-02T03:04:05.12345Z");
-        for invalid in ["2026-01-02T03:04:05.1234560Z", "0000-01-01T00:00:00Z"] {
+        for (stored, expected) in [
+            (
+                "2026-01-02 12:04:05.123450+09",
+                "2026-01-02T03:04:05.12345Z",
+            ),
+            (
+                "2026-01-02 02:34:05.000001-00:30",
+                "2026-01-02T03:04:05.000001Z",
+            ),
+            (
+                "2026-01-02 08:34:05.120000+0530",
+                "2026-01-02T03:04:05.120Z",
+            ),
+            ("2026-01-02T03:04:05Z", "2026-01-02T03:04:05.000Z"),
+        ] {
+            let row = json!({"seen_at": stored});
+            let decoded: Value = repository
+                .decode_row(row.as_object().unwrap().clone())
+                .unwrap_or_else(|error| panic!("{stored}: {}", error.code));
+            assert_eq!(decoded["seen_at"], expected);
+        }
+        for invalid in [
+            "2026-01-02T03:04:05.1234560Z",
+            "2026-01-02x03:04:05Z",
+            "2026-01-02T03:04:05",
+            "0000-01-01T00:00:00Z",
+            "0001-01-01T00:00:00+00:01",
+            "9999-12-31T23:59:59-00:01",
+            "infinity",
+            "-infinity",
+        ] {
             let mut params = Vec::new();
             assert!(encode_value(&DATES.columns[0], &json!(invalid), &mut params).is_err());
             assert!(params.is_empty());

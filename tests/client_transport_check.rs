@@ -8,6 +8,10 @@
 #[path = "../src/client.rs"]
 mod client;
 
+#[allow(dead_code, reason = "The client only uses the RFC 3339 parser.")]
+#[path = "../src/date_time.rs"]
+mod date_time;
+
 #[path = "../src/error_details.rs"]
 mod error_details;
 

@@ -1,9 +1,9 @@
 use crate::database::{DatabasePort, TransactionPort};
+use crate::date_time::{format_unix_millis, parse_postgres_timestamp};
 use crate::orm::{Direction, Filter, FindMany, Order};
 use crate::private_auth::*;
 use crate::server::{OperationError, SessionUser};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::{DateTime, SecondsFormat, Utc};
 use scrypt::{Params, scrypt};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1054,9 +1054,7 @@ fn timestamp(delta: i64) -> Result<String, OperationError> {
 }
 
 fn timestamp_at(millis: i64) -> Result<String, OperationError> {
-    DateTime::<Utc>::from_timestamp_millis(millis)
-        .map(|date| date.to_rfc3339_opts(SecondsFormat::Millis, true))
-        .ok_or_else(OperationError::internal)
+    format_unix_millis(millis).ok_or_else(OperationError::internal)
 }
 
 fn expired(value: &str) -> Result<bool, OperationError> {
@@ -1064,10 +1062,9 @@ fn expired(value: &str) -> Result<bool, OperationError> {
 }
 
 fn parse_timestamp(value: &str) -> Result<i64, OperationError> {
-    let parsed = DateTime::parse_from_rfc3339(value)
-        .or_else(|_| DateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f%#z"))
-        .map_err(|_| OperationError::internal())?;
-    Ok(parsed.timestamp_millis())
+    let parsed = parse_postgres_timestamp(value).ok_or_else(OperationError::internal)?;
+    let millis = parsed.unix_timestamp_nanos().div_euclid(1_000_000);
+    i64::try_from(millis).map_err(|_| OperationError::internal())
 }
 
 fn hash_password(password: &str) -> Result<String, OperationError> {
@@ -2462,6 +2459,24 @@ mod tests {
                 expired
             );
         }
+    }
+
+    #[test]
+    fn auth_expiry_keeps_millisecond_wire_format_and_comparison() {
+        assert_eq!(checked(timestamp_at(0)), "1970-01-01T00:00:00.000Z");
+        assert_eq!(checked(timestamp_at(-1)), "1969-12-31T23:59:59.999Z");
+        for value in [
+            "1969-12-31T23:59:59.999999Z",
+            "1970-01-01 08:59:59.999999+09",
+            "1969-12-31T23:29:59.999999-00:30",
+        ] {
+            assert_eq!(checked(parse_timestamp(value)), -1);
+        }
+        assert_eq!(
+            checked(parse_timestamp("2016-12-31T23:59:60.123Z")),
+            1_483_228_800_123
+        );
+        assert!(parse_timestamp("1970-01-01x00:00:00Z").is_err());
     }
 
     #[test]

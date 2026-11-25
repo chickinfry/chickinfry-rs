@@ -1485,9 +1485,7 @@ mod tests {
     }
 
     fn timestamp(delta: i64) -> String {
-        chrono::DateTime::from_timestamp_millis(testing::NOW + delta)
-            .unwrap()
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        crate::date_time::format_unix_millis(testing::NOW + delta).unwrap()
     }
 
     fn session_script(stored_delta: i64, legacy: bool) -> Vec<(&'static str, Value)> {

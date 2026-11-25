@@ -226,12 +226,9 @@ impl Transport for HttpTransport {
             return Ok(None);
         };
         let credentials = store.credentials();
-        let expires = chrono::DateTime::parse_from_rfc3339(&credentials.expires_at)
-            .map_err(|_| ClientError::new("unauthenticated", None, false))?;
-        let now = chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now());
-        let delay = expires
-            .signed_duration_since(now)
-            .to_std()
+        let expires = crate::date_time::parse_rfc3339(&credentials.expires_at)
+            .ok_or_else(|| ClientError::new("unauthenticated", None, false))?;
+        let delay = Duration::try_from(expires - time::OffsetDateTime::now_utc())
             .unwrap_or_default()
             .saturating_sub(Duration::from_secs(60));
         if renew && delay.is_zero() {
